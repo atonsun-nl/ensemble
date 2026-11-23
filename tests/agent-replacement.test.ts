@@ -1,6 +1,7 @@
 import fs from 'fs'
 import path from 'path'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
+import { isShellCommand } from '../lib/startup-gates'
 import type { BrainEvent } from '../lib/brain-hooks'
 import type { AgentWatchdog } from '../lib/agent-watchdog'
 
@@ -29,14 +30,18 @@ beforeEach(async () => {
   roster.mockReset().mockResolvedValue({ glm: { status: 'limit' }, mimo: { status: 'ok' }, gemini: { status: 'ok' } })
   health.mockReset().mockResolvedValue({ warnings: [] })
   sessionExists.mockReset().mockResolvedValue(false)
-  emit.mockClear(); spawn.mockClear(); kill.mockClear(); paste.mockClear(); ready.mockReset().mockResolvedValue(true)
+  emit.mockClear(); spawn.mockClear(); kill.mockClear(); paste.mockReset().mockResolvedValue(undefined); ready.mockReset().mockResolvedValue(true)
   vi.doMock('../lib/brain-hooks', () => ({ runRoster: roster, emitEvent: emit }))
   vi.doMock('../lib/agent-health', () => ({ checkAgentHealth: health }))
   vi.doMock('../lib/agent-spawner', () => ({
     spawnLocalAgent: spawn, killLocalAgent: kill, spawnRemoteAgent: vi.fn(), killRemoteAgent: vi.fn(), postRemoteSessionCommand: vi.fn(),
-    findRemoteAgent: vi.fn(), isRemoteSessionReady: vi.fn(),
+    findRemoteAgent: vi.fn(), isRemoteSessionReady: vi.fn(), getAgentTokenUsage: vi.fn(async () => 'unknown'),
   }))
-  vi.doMock('../lib/agent-runtime', () => ({ getRuntime: () => ({ sessionExists, pasteFromFile: paste, sendKeys: vi.fn(async () => {}) }) }))
+  vi.doMock('../lib/agent-runtime', () => ({ isShellCommand, getRuntime: () => ({
+    sessionExists, pasteFromFile: paste, sendKeys: vi.fn(async () => {}),
+    getForegroundCommand: vi.fn(async () => 'node'),
+    capturePane: vi.fn(async () => 'Type your message'),
+  }) }))
   vi.doMock('../lib/hosts-config', () => ({ isSelf: vi.fn(() => true), getHostById: vi.fn() }))
   registry = await import('../lib/ensemble-registry')
   replace = (await import('../lib/agent-replacement')).replaceTeamAgent
@@ -60,7 +65,11 @@ async function watch(exists: boolean) {
     markAgentFailed: registry.markAgentFailed, replacementEnabled: () => true, sessionExists: async () => exists,
     replaceAgent: (team, agent, detail) => replace(team.id, agent.name, detail, ready),
     onAgentStalled: (team, agent, detail) => { void emit({ event: 'agent_stalled', teamId: team.id, team: team.name, agent: agent.name, detail, ts: new Date(now).toISOString() }) },
-    getRuntime: () => ({ sessionExists, pasteFromFile: paste, sendKeys: vi.fn(async () => {}) }),
+    getRuntime: () => ({
+    sessionExists, pasteFromFile: paste, sendKeys: vi.fn(async () => {}),
+    getForegroundCommand: vi.fn(async () => 'node'),
+    capturePane: vi.fn(async () => 'Type your message'),
+  }),
     resolveAgentProgram: () => ({ inputMethod: 'pasteFromFile' }), isSelf: () => true,
     getHostById: () => undefined, postRemoteSessionCommand: vi.fn(),
     collabDeliveryFile: () => path.join(root, 'nudge'), now: () => now, nudgeAfterMs: 100, stallAfterMs: 100,
@@ -193,4 +202,73 @@ it('finds and deletes an interrupted remote candidate that had no local ID yet',
   })).toBe(true)
   expect(spawner.findRemoteAgent).toHaveBeenCalledWith('http://maestro.invalid', 'replacement-mimo-2')
   expect(spawner.killRemoteAgent).toHaveBeenCalledWith('http://maestro.invalid', 'found-id')
+})
+
+it.each(['local', 'remote'])('accepts the new %s Lead plan while its prompt is still being delivered', async host => {
+  setManagedWorkflow()
+  const before = registry.getTeam(teamId)!
+  const spawner = await import('../lib/agent-spawner')
+  if (host === 'remote') {
+    const hosts = await import('../lib/hosts-config')
+    vi.mocked(hosts.isSelf).mockReturnValue(false)
+    vi.mocked(hosts.getHostById).mockReturnValue({ id: 'remote', name: 'Remote', url: 'http://maestro.invalid' })
+    before.agents[0].hostId = 'remote'
+    vi.mocked(spawner.isRemoteSessionReady).mockResolvedValue(false)
+    vi.mocked(spawner.spawnRemoteAgent).mockResolvedValue({ id: 'replacement-id' })
+  }
+  registry.updateTeam(teamId, { agents: before.agents, workflow: {
+    ...before.workflow!, lead: 'codex-1', state: 'WAITING_PLAN', plan: undefined,
+  } })
+  const service = await import('../services/ensemble-service')
+  const submitPlan = async () => {
+    const during = registry.getTeam(teamId)!
+    expect(during.workflow?.lead).toBe('mimo-2')
+    expect(during.pendingReplacement?.agentId).toBe('replacement-id')
+    const response = await service.sendTeamMessage(teamId, 'team',
+      '<<COLLAB_EVENT>> {"action":"plan","plan":"Replacement plan"}',
+      'mimo-2', 'first-replacement-plan', undefined, undefined, 'mimo-2')
+    expect(response.status).toBe(200)
+  }
+  if (host === 'remote') vi.mocked(spawner.postRemoteSessionCommand).mockImplementationOnce(submitPlan)
+  else paste.mockImplementationOnce(submitPlan)
+  expect(await replace(teamId, 'codex-1', 'Lead exited', ready)).toBe(true)
+  const current = registry.getTeam(teamId)!
+  expect(current.agents[1].startup).toBe('prompt_delivered')
+  const firstPlan = registry.getMessages(teamId).find(message => message.id === 'first-replacement-plan')!
+  const { applyWorkflowCommand } = await import('../lib/managed-workflow')
+  await applyWorkflowCommand(current, current.workflow!, firstPlan)
+  expect(current.workflow?.plan).toBe('Replacement plan')
+})
+
+it('queues a durable assignment confirmation for the replacement worker inbox', async () => {
+  setManagedWorkflow()
+  const previous = registry.getTeam(teamId)!
+  registry.updateTeam(teamId, { agents: [...previous.agents, {
+    agentId: 'lead-id', name: 'another-lead', program: 'claude', role: 'lead', hostId: 'local',
+    status: 'active', startup: 'prompt_delivered',
+  }] })
+  expect(await replace(teamId, 'codex-1', 'Worker exited', ready)).toBe(true)
+  const notices = registry.getTeam(teamId)!.workflow!.pendingNotices!
+  expect(notices).toHaveLength(1)
+  expect(notices[0].content).toContain('Assignment takeover confirmed: fix to mimo-3 (result.txt)')
+  // Restarting the service flushes persisted notices through its normal lifecycle.
+  sessionExists.mockResolvedValue(true)
+  const service = await import('../services/ensemble-service')
+  await service.checkIdleTeams()
+  const inbox = service.getTeamFeed(teamId, undefined, 'mimo-3').data!.messages
+  expect(inbox.filter(message => message.id === notices[0].id)).toHaveLength(1)
+  expect(inbox.find(message => message.id === notices[0].id)?.delivery).toContainEqual(
+    expect.objectContaining({ recipient: 'mimo-3', status: 'queued', method: 'pull' }))
+  await service.checkIdleTeams()
+  expect(registry.getMessages(teamId).filter(message => message.id === notices[0].id)).toHaveLength(1)
+})
+
+it('marks a registered replacement failed when prompt delivery fails', async () => {
+  setManagedWorkflow()
+  const before = registry.getTeam(teamId)!
+  registry.updateTeam(teamId, { workflow: { ...before.workflow!, lead: 'codex-1' } })
+  paste.mockRejectedValueOnce(new Error('paste failed'))
+  expect(await replace(teamId, 'codex-1', 'Lead exited', ready)).toBe(false)
+  expect(registry.getTeam(teamId)!.agents[1].status).toBe('failed')
+  expect(kill).toHaveBeenCalledWith('replacement-mimo-2')
 })

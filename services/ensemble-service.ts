@@ -919,7 +919,9 @@ async function reconcileManagedAgents(team: EnsembleTeam): Promise<boolean> {
       return false
     }
     if (await replaceTeamAgent(team.id, agent.name, reason, waitForReady)) return false
-    if (getTeam(team.id)?.status !== 'active' || lifecycleWork.has(team.id)) return false
+    const afterReplacement = getTeam(team.id)
+    if (afterReplacement?.status !== 'active' || lifecycleWork.has(team.id) ||
+        afterReplacement.agents.some(candidate => !team.agents.some(previous => previous.name === candidate.name))) return false
     await stopAgent(team, agent)
     agent.status = 'failed'
     if (!workflow.submitted[agent.name]) {
@@ -1004,7 +1006,7 @@ export async function sendTeamMessage(
   if (!team) return { error: 'Team not found', status: 404 }
   if (typeof content !== 'string' || !content.trim() || typeof to !== 'string' ||
       (from !== undefined && typeof from !== 'string') ||
-      (existingId !== undefined && typeof existingId !== 'string')) {
+      (existingId !== undefined && (typeof existingId !== 'string' || !existingId || existingId.length > 256))) {
     return { error: 'Invalid message', status: 400 }
   }
   const sender = authenticatedAgent || from || 'user'
@@ -1016,8 +1018,9 @@ export async function sendTeamMessage(
   if (team.workflow && content.startsWith(receiptPrefix)) {
     let ids: unknown
     try { ids = JSON.parse(content.slice(receiptPrefix.length)) } catch { /* Invalid receipt. */ }
+    // Older journals can contain IDs longer than today's send limit.
     if (to !== 'ensemble' || !Array.isArray(ids) || !ids.length || ids.length > 100 ||
-        ids.some(id => typeof id !== 'string' || !id || id.length > 256)) {
+        ids.some(id => typeof id !== 'string' || !id)) {
       return { status: 400, error: 'Invalid message acknowledgement' }
     }
     const inbox = new Set(getTeamFeed(teamId, undefined, authenticatedAgent).data?.messages.map(message => message.id))

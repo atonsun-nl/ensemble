@@ -142,7 +142,7 @@ Stops all agents, generates summary, cleans up. Also available as `POST /api/ens
 
 ## Feed
 
-A caller can supply a stable message `id` to retry a request. A reused ID with
+A caller can supply a stable message `id` of 1–256 characters to retry a request. Longer or empty IDs return `400` before enqueueing. Existing messages with longer IDs remain eligible for acknowledgement. A reused ID with
 different sender, recipient or content returns `409`. For managed teams, a
 successful POST queues a message for the recipients to read. A managed agent
 credential permits posting as its holder and reading that holder's feed for the

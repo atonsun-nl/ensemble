@@ -200,6 +200,26 @@ describe('rate limiting', () => {
     expect((await replay.json()).message.delivery[0].status).toBe('delivered')
   })
 
+  it('accepts and acknowledges a boundary ID and rejects longer or empty IDs before enqueueing', async () => {
+    const route = `${baseUrl}/api/ensemble/teams/${teamId}`
+    const post = (id: string) => fetch(route, {
+      method: 'POST', headers: operatorHeaders, body: JSON.stringify({ id, to: 'claude-2', content: 'Boundary message' }),
+    })
+    expect((await post('x'.repeat(257))).status).toBe(400)
+    expect((await post('')).status).toBe(400)
+    const id = 'x'.repeat(256)
+    expect((await post(id)).status).toBe(200)
+    const ack = await fetch(route, {
+      method: 'POST', headers: { ...operatorHeaders, Authorization:
+        `Bearer ${agentEnvironments['rate-limit-team-claude-2'].ENSEMBLE_AGENT_TOKEN}` },
+      body: JSON.stringify({ to: 'ensemble', content: '<<COLLAB_RECEIVED>> ' + JSON.stringify([id]) }),
+    })
+    expect(ack.status).toBe(200)
+    expect((await (await post(id)).json()).message.delivery[0].status).toBe('delivered')
+    const inbox = (await (await fetch(route + '/feed', { headers: operatorHeaders })).json()).messages
+    expect(inbox.some((message: { id: string }) => message.id === 'x'.repeat(257))).toBe(false)
+  })
+
   it('queues 100 authenticated messages while keeping the operator IP budget separate', async () => {
     const route = `${baseUrl}/api/ensemble/teams/${teamId}`
     const credentials = (agent: string) => ({

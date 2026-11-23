@@ -1,6 +1,8 @@
 import fs from 'fs'
 import path from 'path'
+import { isIP } from 'net'
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'crypto'
+import { normalizeIp } from './ip-address'
 import { getEnsembleRegistryDir } from './ensemble-paths'
 
 const digest = (value: string) => createHash('sha256').update(value).digest()
@@ -20,10 +22,12 @@ export function issueAgentEnvironment(teamId: string, agent: string): Record<str
   } finally {
     fs.rmSync(temporary, { force: true })
   }
+  const bind = normalizeIp(process.env.ENSEMBLE_HOST || '127.0.0.1')
+  const localHost = isIP(bind) === 6 ? `[${bind === '::' ? '::1' : bind}]` : '127.0.0.1'
   return {
     ENSEMBLE_AGENT_TOKEN: `agent.${Buffer.from(agent).toString('base64url')}.${secret}`,
     ENSEMBLE_AGENT_URL: process.env.ENSEMBLE_AGENT_URL || process.env.ENSEMBLE_URL ||
-      `http://127.0.0.1:${process.env.ENSEMBLE_PORT || process.env.ORCHESTRA_PORT || '23000'}`,
+      `http://${localHost}:${process.env.ENSEMBLE_PORT || process.env.ORCHESTRA_PORT || '23000'}`,
   }
 }
 

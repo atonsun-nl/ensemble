@@ -308,3 +308,19 @@ it('re-reads the next team after a concurrent poll dispatches its worker', async
   expect(fakes.deliver.mock.calls.filter(([session]) => session === 'next-team-claude-2')).toHaveLength(1)
   expect(registry.getMessages(next.id).filter(m => m.content.startsWith('Lead plan acknowledged'))).toHaveLength(1)
 })
+
+it('allows acknowledgement of a long ID retained from an older journal', async () => {
+  const team = (await create()).data!.team
+  const recipient = team.agents[1].name
+  const id = 'legacy-' + 'x'.repeat(257)
+  registry.appendMessage(team.id, {
+    id, teamId: team.id, from: 'user', to: recipient, content: 'Existing message',
+    timestamp: new Date().toISOString(), type: 'chat',
+    delivery: [{ recipient, status: 'queued', at: new Date().toISOString(), method: 'pull' }],
+  })
+  const receipt = await service.sendTeamMessage(team.id, 'ensemble', '<<COLLAB_RECEIVED>> ' + JSON.stringify([id]),
+    recipient, undefined, undefined, undefined, recipient)
+  expect(receipt.status).toBe(200)
+  expect(service.getTeamFeed(team.id, undefined, recipient).data!.messages.find(message =>
+    message.id === id)?.delivery?.[0]?.status).toBe('delivered')
+})

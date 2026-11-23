@@ -107,18 +107,11 @@ export async function replaceTeamAgent(
     fs.appendFileSync(collabSessionsFile(teamId), `${session}\n`)
     if (!await waitForReady(session, program, old.hostId, 45_000)) throw new Error('Replacement did not become ready')
     if (stopping.has(teamId) || getTeam(teamId)?.status !== 'active') throw new Error('Team stopped during replacement')
-    if (deliverNow) {
-      const runtime = getRuntime()
-      if (host) await postRemoteSessionCommand(host.url, session, prompt)
-      else if (resolveAgentProgram(program).inputMethod === 'pasteFromFile') {
-        await pasteAgentInput(runtime, session, promptFile, prompt, resolveAgentProgram(program).pasteEnterCount)
-      } else await runtime.sendKeys(session, prompt.replace(/[\r\n]+/g, ' '), { literal: true, enter: true, agentInput: true })
-    }
     const current = getTeam(teamId)
     if (stopping.has(teamId) || !current || current.status !== 'active') throw new Error('Team stopped during replacement')
     replacement.agentId = spawned.id
     replacement.sessionName = 'sessionName' in spawned ? String(spawned.sessionName) : session
-    replacement.startup = deliverNow ? 'prompt_delivered' : 'cli_ready'
+    replacement.startup = deliverNow ? 'prompt_sending' : 'cli_ready'
     replacement.status = 'active'
     replacement.startedAt = new Date().toISOString()
     current.agents = current.agents.map(a => a.name === old.name ? { ...a, status: 'replaced' as const } : a)
@@ -139,7 +132,33 @@ export async function replaceTeamAgent(
         current.workflow.startupDeadline = new Date(Date.now() + 120_000).toISOString()
       } else if (current.workflow.plan && !Object.keys(current.workflow.blockers).length) current.workflow.state = 'WORKING'
     }
-    updateTeam(teamId, { agents: current.agents, workflow: current.workflow, pendingReplacement: undefined })
+    if (current.workflow && current.workflow.lead !== replacement.name) {
+      const paths = Object.entries(current.workflow.fileOwners)
+        .filter(([, owner]) => owner === replacement.name).map(([file]) => file)
+      for (const [task, owner] of Object.entries(current.workflow.taskOwners)) {
+        if (owner !== replacement.name) continue
+        (current.workflow.pendingNotices ??= []).push({
+          id: randomUUID(),
+          content: `Assignment takeover confirmed: ${task} to ${replacement.name} (${paths.join(', ')}). Previous owner: ${old.name}. Reason: ${detail}`,
+        })
+      }
+    }
+    // Register the actor, role and transferred work before the CLI can reply.
+    // Keep the pending attempt until delivery is confirmed so a restart can
+    // stop a candidate whose prompt may only have been partially submitted.
+    updateTeam(teamId, { agents: current.agents, workflow: current.workflow })
+    if (deliverNow) {
+      const runtime = getRuntime()
+      if (host) await postRemoteSessionCommand(host.url, session, prompt)
+      else if (resolveAgentProgram(program).inputMethod === 'pasteFromFile') {
+        await pasteAgentInput(runtime, session, promptFile, prompt, resolveAgentProgram(program).pasteEnterCount)
+      } else await runtime.sendKeys(session, prompt.replace(/[\r\n]+/g, ' '), { literal: true, enter: true, agentInput: true })
+    }
+    const delivered = getTeam(teamId)
+    if (stopping.has(teamId) || !delivered || delivered.status !== 'active') throw new Error('Team stopped during replacement')
+    delivered.agents = delivered.agents.map(agent => agent.name === replacement.name
+      ? { ...agent, startup: deliverNow ? 'prompt_delivered' as const : 'cli_ready' as const } : agent)
+    updateTeam(teamId, { agents: delivered.agents, pendingReplacement: undefined })
     const ts = new Date().toISOString()
     appendMessage(teamId, { id: randomUUID(), teamId, from: 'ensemble', to: 'team', type: 'chat', timestamp: ts, content: `Replaced ${old.name} with ${replacement.name} (${old.role}): ${detail}. Acceptance: ${managedContext?.acceptance ?? 'pending'}` })
     void emitEvent({ event: 'agent_replaced', teamId, team: team.name, ts, agent: old.name, replacement: replacement.name, detail })
@@ -147,6 +166,14 @@ export async function replaceTeamAgent(
     cleanup = undefined
     return true
   } catch (error) {
+    const current = getTeam(teamId)
+    if (session && current?.status === 'active') {
+      const candidate = current.agents.find(agent => agent.sessionName === session)
+      if (candidate) {
+        candidate.status = 'failed'
+        updateTeam(teamId, { agents: current.agents })
+      }
+    }
     appendMessage(teamId, { id: randomUUID(), teamId, from: 'ensemble', to: 'team', type: 'chat', timestamp: new Date().toISOString(),
       content: `Replacement for ${agentName} failed: ${error instanceof Error ? error.message : 'startup failure'}` })
     console.warn(`[Ensemble] Replacement failed for ${agentName}: ${error instanceof Error ? error.message : String(error)}`)
