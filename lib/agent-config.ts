@@ -200,6 +200,6 @@ export function buildAgentEnvironment(program: string): Record<string, string> {
     }
   }
   Object.assign(environment, readEnsembleConfig().agentEnv)
-  for (const key of ['CLAUDECODE', 'ENSEMBLE_API_TOKEN', ...(agent.unsetEnv ?? [])]) delete environment[key]
+  for (const key of ['CLAUDECODE', 'ENSEMBLE_API_TOKEN', 'ENSEMBLE_AGENT_TOKEN', ...(agent.unsetEnv ?? [])]) delete environment[key]
   return environment
 }

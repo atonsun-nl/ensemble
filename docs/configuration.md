@@ -368,7 +368,13 @@ Existing teams without a workflow record retain the exact one-time
 `<<COLLAB_DONE>>` protocol.
 
 Use `team-say <team-id> <actor> team '<<COLLAB_EVENT>> {"action":"…"}'`
-to record a workflow action. The feed records accepted and rejected actions.
+to record a workflow action. The service authenticates the actor using the
+team-scoped credential injected at spawn. It rejects a different sender name
+and accepts Lead actions only from the current Lead credential. A worker
+may act on an assignment after the service posts its confirmation. Agents
+share an operating-system trust boundary when they run under the same account.
+Teams started before credentials were introduced need a fresh launch for
+authenticated workflow actions. Their existing journal and worktree remain available.
 
 | Action | Actor | Required fields |
 |---|---|---|
@@ -383,9 +389,13 @@ to record a workflow action. The feed records accepted and rejected actions.
 | `close` | Lead | `report`, after acceptance |
 | `activity` | Team member | `state` (`busy` or `idle`), optional `tool` |
 
-Use `team-read <team-id> <agent-name>` to read and acknowledge queued messages
-at a safe point. `--wait` polls for up to 120 seconds. `--all` includes
-previously read messages. Delivery records show when input was queued or read.
+Use `team-read <team-id> <agent-name>` to read queued messages at a safe point.
+The output includes stable message IDs. After processing, run
+`team-read <team-id> <agent-name> --ack ID [ID ...]` to confirm up to 100
+messages. A read interrupted before acknowledgement can be repeated using
+the same IDs. `--wait` polls for up to 120 seconds. `--all` includes previously
+acknowledged messages for that recipient. Delivery records distinguish queued
+messages from acknowledged ones.
 The service does not inject ordinary messages or watchdog nudges into managed
 panes. An `activity` event is a cooperative report from the agent. It does
 not trace internal CLI tool calls.
@@ -430,7 +440,10 @@ a configured regression test and recording a counterexample. Accepting code
 changes requires both registered path ownership and configured checks. The
 service stores the baseline and candidate SHA, binary-capable Git diff,
 untracked-file hashes, exit codes and stdout/stderr in an acceptance artifact.
-Changes to the reviewed Git snapshot invalidate acceptance at close.
+Set `requireRegression: true` in the create-team request for a bug fix that must
+prove regression on the baseline. The service verifies the reviewed Git snapshot
+when the Lead requests closure and again after confirming the agents have stopped.
+A late change fails the run and the worktree remains available.
 
 ### Recovery and preflight
 
@@ -457,6 +470,10 @@ must report `exists: true`, a non-shell `foregroundCommand` and either
 `ready: true` or `output` containing the agent's ready marker. A status response
 that reports only session existence works with the explicit compatibility
 setting `requireLeadReady: false`. Remote agents need access to the team feed
-and a bridge or shared journal to publish events. Configure the bridge's
-operator credentials separately from the agent environment. Validate remote
-changes in the local review worktree before acceptance.
+and a reachable Ensemble API URL. Set `ENSEMBLE_AGENT_URL` on the service
+when agents reach it through a different address. Maestro must support injecting
+the `environment` map from agent creation into the CLI process at wake.
+For crash recovery it must also support lookup by exact agent name in the agents
+list. The provisioned key allows each agent to read its own inbox and post as
+itself. Operator credentials belong in the launcher or bridge environment.
+Validate remote changes in the local review worktree before acceptance.

@@ -1,7 +1,7 @@
 import fs from 'fs'
 import path from 'path'
 import os from 'os'
-import { v4 as uuidv4 } from 'uuid'
+import { randomUUID } from 'crypto'
 import type { EnsembleTeam, EnsembleMessage, CreateTeamRequest } from '../types/ensemble'
 import { getEnsembleRegistryDir } from './ensemble-paths'
 import { emitEvent } from './brain-hooks'
@@ -52,7 +52,7 @@ function readTeamsFile(): EnsembleTeam[] {
 }
 
 function atomicWrite(file: string, content: string): void {
-  const temporary = `${file}.${uuidv4()}.tmp`
+  const temporary = `${file}.${randomUUID()}.tmp`
   try {
     fs.writeFileSync(temporary, content)
     fs.renameSync(temporary, file)
@@ -128,7 +128,7 @@ export function createTeam(request: CreateTeamRequest): EnsembleTeam {
   return withTeamsLock(() => {
     const teams = readTeamsFile()
     const team: EnsembleTeam = {
-      id: uuidv4(),
+      id: randomUUID(),
       name: request.name,
       description: request.description,
       status: 'forming',
@@ -184,11 +184,9 @@ export function appendMessage(teamId: string, message: EnsembleMessage): void {
 
 const warnedMessageFiles = new Set<string>()
 
-export function getMessages(teamId: string, since?: string): EnsembleMessage[] {
-  const sources = [
-    path.join(MESSAGES_DIR, teamId, 'feed.jsonl'),
-    collabMessagesFile(teamId),
-  ]
+export function getMessages(teamId: string, since?: string, order: 'timeline' | 'queue' = 'timeline'): EnsembleMessage[] {
+  const primary = path.join(MESSAGES_DIR, teamId, 'feed.jsonl')
+  const sources = order === 'queue' ? [primary] : [primary, collabMessagesFile(teamId)]
 
   const byId = new Map<string, EnsembleMessage>()
 
@@ -200,6 +198,10 @@ export function getMessages(teamId: string, since?: string): EnsembleMessage[] {
       try {
         msg = JSON.parse(line) as EnsembleMessage
         if (!msg || typeof msg.content !== 'string') throw new Error('Invalid message record')
+        if (file !== primary) {
+          delete msg.authenticatedAgent
+          delete msg.delivery
+        }
       } catch {
         if (!warnedMessageFiles.has(file)) {
           console.warn(`[Ensemble] Skipping corrupt JSONL records in ${file}`)
@@ -217,7 +219,7 @@ export function getMessages(teamId: string, since?: string): EnsembleMessage[] {
 
   let messages = [...byId.values()]
   // Sort by timestamp (messages without timestamp go to the end)
-  messages.sort((a, b) => {
+  if (order === 'timeline') messages.sort((a, b) => {
     const ta = a.timestamp ? new Date(a.timestamp).getTime() : Infinity
     const tb = b.timestamp ? new Date(b.timestamp).getTime() : Infinity
     return ta - tb

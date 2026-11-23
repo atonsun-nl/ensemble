@@ -33,9 +33,11 @@ beforeEach(async () => {
   vi.doMock('../lib/brain-hooks', () => ({ runRoster: roster, emitEvent: emit }))
   vi.doMock('../lib/agent-health', () => ({ checkAgentHealth: health }))
   vi.doMock('../lib/agent-spawner', () => ({
-          spawnLocalAgent: spawn, killLocalAgent: kill, spawnRemoteAgent: vi.fn(), killRemoteAgent: vi.fn(), postRemoteSessionCommand: vi.fn() }))
+    spawnLocalAgent: spawn, killLocalAgent: kill, spawnRemoteAgent: vi.fn(), killRemoteAgent: vi.fn(), postRemoteSessionCommand: vi.fn(),
+    findRemoteAgent: vi.fn(), isRemoteSessionReady: vi.fn(),
+  }))
   vi.doMock('../lib/agent-runtime', () => ({ getRuntime: () => ({ sessionExists, pasteFromFile: paste, sendKeys: vi.fn(async () => {}) }) }))
-  vi.doMock('../lib/hosts-config', () => ({ isSelf: () => true, getHostById: vi.fn() }))
+  vi.doMock('../lib/hosts-config', () => ({ isSelf: vi.fn(() => true), getHostById: vi.fn() }))
   registry = await import('../lib/ensemble-registry')
   replace = (await import('../lib/agent-replacement')).replaceTeamAgent
   const team = registry.createTeam({ name: 'replacement', description: 'Original task', agents: [{ program: 'codex', role: 'reviewer' }], workingDirectory: root, worktree: 'team' })
@@ -163,4 +165,32 @@ it('refuses managed replacement while the previous session can still write', asy
   expect(await replace(teamId, 'codex-1', 'CLI exited', ready)).toBe(false)
   expect(spawn).not.toHaveBeenCalled()
   expect(registry.getTeam(teamId)?.workflow?.fileOwners['result.txt']).toBe('codex-1')
+})
+
+it('keeps a replacement worker at CLI-ready while the team awaits a Lead plan', async () => {
+  setManagedWorkflow()
+  const { workflow } = registry.getTeam(teamId)!
+  registry.updateTeam(teamId, { workflow: { ...workflow!, state: 'WAITING_PLAN', plan: undefined, blockers: {} } })
+  expect(await replace(teamId, 'codex-1', 'CLI exited before the plan', ready)).toBe(true)
+  expect(paste).not.toHaveBeenCalled()
+  expect(registry.getTeam(teamId)).toMatchObject({
+    agents: [{ status: 'replaced' }, { name: 'mimo-2', startup: 'cli_ready' }],
+    workflow: { state: 'WAITING_PLAN' },
+  })
+})
+
+it('finds and deletes an interrupted remote candidate that had no local ID yet', async () => {
+  const spawner = await import('../lib/agent-spawner')
+  const hosts = await import('../lib/hosts-config')
+  vi.mocked(hosts.isSelf).mockReturnValue(false)
+  vi.mocked(hosts.getHostById).mockReturnValue({ id: 'remote', name: 'Remote', url: 'http://maestro.invalid' })
+  vi.mocked(spawner.findRemoteAgent).mockResolvedValue('found-id')
+  vi.mocked(spawner.killRemoteAgent).mockResolvedValue(true)
+  vi.mocked(spawner.isRemoteSessionReady).mockResolvedValue(false)
+  const { recoverPendingReplacement } = await import('../lib/agent-replacement')
+  expect(await recoverPendingReplacement(teamId, {
+    oldAgent: 'codex-1', sessionName: 'replacement-mimo-2', hostId: 'remote',
+  })).toBe(true)
+  expect(spawner.findRemoteAgent).toHaveBeenCalledWith('http://maestro.invalid', 'replacement-mimo-2')
+  expect(spawner.killRemoteAgent).toHaveBeenCalledWith('http://maestro.invalid', 'found-id')
 })

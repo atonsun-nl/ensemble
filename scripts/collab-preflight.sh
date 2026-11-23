@@ -94,8 +94,8 @@ elif [ -f "${ENSEMBLE_CONFIG:-${HOME}/.config/ensemble/config.json}" ] && ! comm
   warn "Health config found, but python3 is unavailable; health check skipped"
 fi
 if [ "$HAS_HEALTH_CONFIG" = 1 ] && command -v node > /dev/null 2>&1; then
-  if [ -f "$SCRIPT_DIR/../node_modules/tsx/dist/loader.mjs" ]; then
-    HEALTH_AGENTS=$(NODE_NO_WARNINGS=1 node --import "$SCRIPT_DIR/../node_modules/tsx/dist/loader.mjs" "$SCRIPT_DIR/agent-health.ts" "$REQUESTED_AGENTS" "$EXPLICIT_AGENTS")
+  if [ -f "$SCRIPT_DIR/../node_modules/tsx/dist/cli.mjs" ]; then
+    HEALTH_AGENTS=$(NODE_NO_WARNINGS=1 node "$SCRIPT_DIR/../node_modules/tsx/dist/cli.mjs" "$SCRIPT_DIR/agent-health.ts" "$REQUESTED_AGENTS" "$EXPLICIT_AGENTS")
     HEALTH_EXIT=$?
     if [ "$HEALTH_EXIT" = "7" ]; then exit 7; fi
     if [ "$HEALTH_EXIT" != "0" ]; then
@@ -310,10 +310,10 @@ done
 if [ -z "${ENSEMBLE_AGENTS_CONFIG:-}" ] && ! command -v codex >/dev/null 2>&1; then
   fail 4 "codex binary not in PATH"
 fi
-if ! command -v node >/dev/null 2>&1 || [ ! -f "$SCRIPT_DIR/../node_modules/tsx/dist/loader.mjs" ]; then
-  fail 4 "Codex preflight requires Node.js and the installed tsx loader"
+if ! command -v node >/dev/null 2>&1 || [ ! -f "$SCRIPT_DIR/../node_modules/tsx/dist/cli.mjs" ]; then
+  fail 4 "Codex preflight requires Node.js and the installed tsx CLI"
 fi
-CODEX_CHECK=$(node --import "$SCRIPT_DIR/../node_modules/tsx/dist/loader.mjs" \
+CODEX_CHECK=$(node "$SCRIPT_DIR/../node_modules/tsx/dist/cli.mjs" \
   "$SCRIPT_DIR/codex-preflight.ts" "$CODEX_PROGRAM" 2>&1)
 if [ "$?" -ne 0 ]; then
   warn "Codex preflight failed: $CODEX_CHECK"

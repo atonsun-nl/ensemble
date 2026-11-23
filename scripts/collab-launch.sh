@@ -210,7 +210,7 @@ for KEY in ENSEMBLE_URL ENSEMBLE_DATA_DIR ENSEMBLE_PORT ENSEMBLE_HOST ENSEMBLE_C
     MONITOR_ENV_PREFIX+="$KEY=$(printf '%q' "$VALUE") "
   fi
 done
-MONITOR_CMD="cd '$REPO_DIR' && ${MONITOR_ENV_PREFIX}node --import tsx cli/monitor.ts $TEAM_ID"
+MONITOR_CMD="cd '$REPO_DIR' && ${MONITOR_ENV_PREFIX}./node_modules/.bin/tsx cli/monitor.ts $TEAM_ID"
 MONITOR_PREF="${COLLAB_MONITOR:-auto}"
 
 use_herdr=false
@@ -251,7 +251,7 @@ elif [ "$use_herdr" = true ]; then
     MONITOR_SESSION="ensemble-$TEAM_ID"
     tmux kill-session -t "$MONITOR_SESSION" 2>/dev/null || true
     tmux new-session -d -s "$MONITOR_SESSION" -c "$REPO_DIR" \
-      "node --import tsx cli/monitor.ts $TEAM_ID"
+      "./node_modules/.bin/tsx cli/monitor.ts $TEAM_ID"
     echo -e "  ${CHECK} Monitor ready ${D}(tmux attach -t $MONITOR_SESSION)${R}"
     MONITOR_MODE="session"
   fi
@@ -277,7 +277,7 @@ elif [ "$use_iterm" = true ]; then
     MONITOR_SESSION="ensemble-$TEAM_ID"
     tmux kill-session -t "$MONITOR_SESSION" 2>/dev/null || true
     tmux new-session -d -s "$MONITOR_SESSION" -c "$REPO_DIR" \
-      "node --import tsx cli/monitor.ts $TEAM_ID"
+      "./node_modules/.bin/tsx cli/monitor.ts $TEAM_ID"
     echo -e "  ${CHECK} Monitor ready ${D}(tmux attach -t $MONITOR_SESSION)${R}"
     MONITOR_MODE="session"
   fi

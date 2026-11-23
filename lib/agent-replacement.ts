@@ -1,14 +1,15 @@
 import fs from 'fs'
 import path from 'path'
 import { fileURLToPath } from 'url'
-import { v4 as uuidv4 } from 'uuid'
+import { randomUUID } from 'crypto'
 import { availableAgentKeys, resolveAgentProgram, shellEscape } from './agent-config'
 import { checkAgentHealth } from './agent-health'
 import { emitEvent, runRoster } from './brain-hooks'
 import { readEnsembleConfig } from './ensemble-config'
 import { getTeam, getMessages, updateTeam, appendMessage } from './ensemble-registry'
-import { spawnLocalAgent, killLocalAgent, spawnRemoteAgent, killRemoteAgent, postRemoteSessionCommand, isRemoteSessionReady } from './agent-spawner'
+import { spawnLocalAgent, killLocalAgent, spawnRemoteAgent, killRemoteAgent, postRemoteSessionCommand, isRemoteSessionReady, findRemoteAgent } from './agent-spawner'
 import { getRuntime } from './agent-runtime'
+import { issueAgentEnvironment } from './agent-credentials'
 import { pasteAgentInput } from './agent-input'
 import { isSelf, getHostById } from './hosts-config'
 import { collabPromptFile, collabSessionsFile, ensureCollabDirs } from './collab-paths'
@@ -57,6 +58,8 @@ export async function replaceTeamAgent(
     const context = Buffer.from(recent).subarray(-8000).toString('utf8')
     const scripts = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../scripts')
     const workflow = team.workflow
+    const deliverNow = !workflow || workflow.lead === old.name
+    const environment = workflow ? issueAgentEnvironment(teamId, replacement.name) : undefined
     const managedContext = workflow && {
       state: workflow.state, plan: workflow.plan,
       taskOwners: Object.fromEntries(Object.entries(workflow.taskOwners).map(([key, owner]) => [key, owner === old.name ? replacement.name : owner])),
@@ -79,7 +82,7 @@ export async function replaceTeamAgent(
     ].join('\n')
     ensureCollabDirs(teamId)
     const promptFile = collabPromptFile(teamId, replacement.name)
-    fs.writeFileSync(promptFile, prompt)
+    fs.writeFileSync(promptFile, prompt, { mode: 0o600 })
     if (host) {
       await killRemoteAgent(host.url, old.agentId)
       if (workflow && await isRemoteSessionReady(host.url, previousSession) !== false) throw new Error('Previous remote session could not be confirmed stopped')
@@ -89,23 +92,33 @@ export async function replaceTeamAgent(
     }
     if (!host) cleanup = () => killLocalAgent(session!)
     const spawned = host
-      ? await spawnRemoteAgent(host.url, session, program, cwd, workflow ? undefined : team.description, team.name)
-      : await spawnLocalAgent({ name: session, program, workingDirectory: cwd, hostId: old.hostId })
-    if (host) cleanup = () => killRemoteAgent(host.url, spawned.id)
+      ? await spawnRemoteAgent(host.url, session, program, cwd, workflow ? undefined : team.description, team.name, {
+          environment,
+          onCreated: id => {
+            cleanup = async () => { await killRemoteAgent(host.url, id) }
+            if (workflow) updateTeam(teamId, { pendingReplacement: { ...pending, agentId: id } })
+          },
+        })
+      : await spawnLocalAgent({ name: session, program, workingDirectory: cwd, hostId: old.hostId,
+          ...(environment ? { agentEnvironment: environment } : {}),
+        })
+    if (host) cleanup = async () => { await killRemoteAgent(host.url, spawned.id) }
     if (workflow) updateTeam(teamId, { pendingReplacement: { ...pending, agentId: spawned.id } })
     fs.appendFileSync(collabSessionsFile(teamId), `${session}\n`)
     if (!await waitForReady(session, program, old.hostId, 45_000)) throw new Error('Replacement did not become ready')
     if (stopping.has(teamId) || getTeam(teamId)?.status !== 'active') throw new Error('Team stopped during replacement')
-    const runtime = getRuntime()
-    if (host) await postRemoteSessionCommand(host.url, session, prompt)
-    else if (resolveAgentProgram(program).inputMethod === 'pasteFromFile') {
-      await pasteAgentInput(runtime, session, promptFile, prompt, resolveAgentProgram(program).pasteEnterCount)
-    } else await runtime.sendKeys(session, prompt.replace(/[\r\n]+/g, ' '), { literal: true, enter: true, agentInput: true })
+    if (deliverNow) {
+      const runtime = getRuntime()
+      if (host) await postRemoteSessionCommand(host.url, session, prompt)
+      else if (resolveAgentProgram(program).inputMethod === 'pasteFromFile') {
+        await pasteAgentInput(runtime, session, promptFile, prompt, resolveAgentProgram(program).pasteEnterCount)
+      } else await runtime.sendKeys(session, prompt.replace(/[\r\n]+/g, ' '), { literal: true, enter: true, agentInput: true })
+    }
     const current = getTeam(teamId)
     if (stopping.has(teamId) || !current || current.status !== 'active') throw new Error('Team stopped during replacement')
     replacement.agentId = spawned.id
     replacement.sessionName = 'sessionName' in spawned ? String(spawned.sessionName) : session
-    replacement.startup = 'prompt_delivered'
+    replacement.startup = deliverNow ? 'prompt_delivered' : 'cli_ready'
     replacement.status = 'active'
     replacement.startedAt = new Date().toISOString()
     current.agents = current.agents.map(a => a.name === old.name ? { ...a, status: 'replaced' as const } : a)
@@ -124,17 +137,17 @@ export async function replaceTeamAgent(
         current.workflow.state = 'WAITING_PLAN'
         current.workflow.plan = undefined
         current.workflow.startupDeadline = new Date(Date.now() + 120_000).toISOString()
-      } else if (!Object.keys(current.workflow.blockers).length) current.workflow.state = 'WORKING'
+      } else if (current.workflow.plan && !Object.keys(current.workflow.blockers).length) current.workflow.state = 'WORKING'
     }
     updateTeam(teamId, { agents: current.agents, workflow: current.workflow, pendingReplacement: undefined })
     const ts = new Date().toISOString()
-    appendMessage(teamId, { id: uuidv4(), teamId, from: 'ensemble', to: 'team', type: 'chat', timestamp: ts, content: `Replaced ${old.name} with ${replacement.name} (${old.role}): ${detail}. Acceptance: ${managedContext?.acceptance ?? 'pending'}` })
+    appendMessage(teamId, { id: randomUUID(), teamId, from: 'ensemble', to: 'team', type: 'chat', timestamp: ts, content: `Replaced ${old.name} with ${replacement.name} (${old.role}): ${detail}. Acceptance: ${managedContext?.acceptance ?? 'pending'}` })
     void emitEvent({ event: 'agent_replaced', teamId, team: team.name, ts, agent: old.name, replacement: replacement.name, detail })
     void emitEvent({ event: 'agent_ready', teamId, team: team.name, ts, agent: replacement.name })
     cleanup = undefined
     return true
   } catch (error) {
-    appendMessage(teamId, { id: uuidv4(), teamId, from: 'ensemble', to: 'team', type: 'chat', timestamp: new Date().toISOString(),
+    appendMessage(teamId, { id: randomUUID(), teamId, from: 'ensemble', to: 'team', type: 'chat', timestamp: new Date().toISOString(),
       content: `Replacement for ${agentName} failed: ${error instanceof Error ? error.message : 'startup failure'}` })
     console.warn(`[Ensemble] Replacement failed for ${agentName}: ${error instanceof Error ? error.message : String(error)}`)
     return false
@@ -157,13 +170,15 @@ export async function recoverPendingReplacement(
   if (pending.hostId && !isSelf(pending.hostId)) {
     const host = getHostById(pending.hostId)
     if (!host) return false
-    if (pending.agentId) await killRemoteAgent(host.url, pending.agentId)
+    const id = pending.agentId ?? await findRemoteAgent(host.url, pending.sessionName)
+    if (id === undefined) return false
+    if (id !== null && await killRemoteAgent(host.url, id) === false) return false
     if (await isRemoteSessionReady(host.url, pending.sessionName) !== false) return false
   } else {
     await killLocalAgent(pending.sessionName)
     if (await getRuntime().sessionExists(pending.sessionName)) return false
   }
-  appendMessage(teamId, { id: uuidv4(), teamId, from: 'ensemble', to: 'team', type: 'chat', timestamp: new Date().toISOString(),
+  appendMessage(teamId, { id: randomUUID(), teamId, from: 'ensemble', to: 'team', type: 'chat', timestamp: new Date().toISOString(),
     content: `Cleared interrupted replacement for ${pending.oldAgent} (${pending.sessionName})` })
   return true
 }

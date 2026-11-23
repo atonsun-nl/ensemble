@@ -70,7 +70,7 @@ function snapshot(cwd: string, baseline: string) {
 
 export async function applyWorkflowCommand(team: EnsembleTeam, workflow: ManagedWorkflow, message: EnsembleMessage, signal?: AbortSignal): Promise<string | undefined> {
   if (!message.content.startsWith(commandPrefix)) return undefined
-  const actor = team.agents.find(agent => agent.name === message.from && agent.status === 'active' && (!agent.startup || agent.startup === 'prompt_delivered'))
+  const actor = team.agents.find(agent => agent.name === message.authenticatedAgent && agent.status === 'active' && (!agent.startup || agent.startup === 'prompt_delivered'))
   if (!actor) throw new Error('Sender is not an active team member')
   const event = JSON.parse(message.content.slice(commandPrefix.length))
   if (!event || typeof event !== 'object' || Array.isArray(event)) throw new Error('Expected a workflow event object')
@@ -81,16 +81,16 @@ export async function applyWorkflowCommand(team: EnsembleTeam, workflow: Managed
     mustBeLead()
     if (workflow.state !== 'WAITING_PLAN') throw new Error('Team is not waiting for a plan')
     workflow.plan = text(event.plan)
-    workflow.state = 'WORKING'
+    workflow.state = Object.keys(workflow.blockers).length ? 'BLOCKED' : 'WORKING'
     if (workflow.staged) workflow.phaseDeadline = new Date(Date.now() + (workflow.stagedConfig?.execTimeoutMs ?? 300_000)).toISOString()
-    return 'Lead plan acknowledged'
+    return `Lead plan acknowledged: ${workflow.plan}`
   }
   if (event.action === 'activity' && (event.state === 'idle' || event.state === 'busy')) {
     workflow.activity ??= {}
     workflow.activity[actor.name] = { state: event.state, at: message.timestamp, tool: typeof event.tool === 'string' ? event.tool.slice(0, 100) : undefined }
     return undefined
   }
-  if (workflow.state === 'STARTING' || workflow.state === 'WAITING_PLAN' || workflow.state === 'DONE') {
+  if (workflow.state === 'STARTING' || workflow.state === 'WAITING_PLAN' || workflow.state === 'CLOSING' || workflow.state === 'DONE') {
     throw new Error(`Workflow action unavailable in ${workflow.state}`)
   }
   switch (event.action) {
@@ -129,7 +129,7 @@ export async function applyWorkflowCommand(team: EnsembleTeam, workflow: Managed
       delete workflow.submitted[owner]
       for (const file of paths) workflow.fileOwners[file] = owner
       Object.defineProperty(workflow.taskOwners, task, { value: owner, enumerable: true, writable: true, configurable: true })
-      return `${event.takeover === true ? 'Takeover' : 'Assigned'} ${task} to ${owner} (${paths.join(', ')})${event.takeover === true ? `: ${event.reason}` : ''}`
+      return `${event.takeover === true ? 'Assignment takeover confirmed' : 'Assignment confirmed'}: ${task} to ${owner} (${paths.join(', ')})${event.takeover === true ? `: ${event.reason}` : ''}`
     }
     case 'release': {
       mustBeLead()
@@ -146,12 +146,17 @@ export async function applyWorkflowCommand(team: EnsembleTeam, workflow: Managed
       workflow.state = 'BLOCKED'
       workflow.acceptance = undefined
       return `${actor.name} reported a blocker`
-    case 'unblock':
+    case 'unblock': {
       const owner = event.owner === undefined ? actor.name : text(event.owner)
       if (owner !== actor.name) mustBeLead()
+      if (!Object.hasOwn(workflow.blockers, owner)) return undefined
       delete workflow.blockers[owner]
-      workflow.state = Object.keys(workflow.blockers).length ? 'BLOCKED' : 'WORKING'
+      workflow.state = Object.keys(workflow.blockers).length ? 'BLOCKED' :
+        Object.keys(workflow.submitted).length && Object.values(workflow.taskOwners)
+          .every(assigned => Object.hasOwn(workflow.submitted, assigned)) ? 'REVIEW' : 'WORKING'
+      if (workflow.staged && workflow.state === 'REVIEW') setReviewDeadline(workflow)
       return `${actor.name} cleared a blocker`
+    }
     case 'decision':
       mustBeLead()
       workflow.decisions.push(text(event.decision))
@@ -173,7 +178,7 @@ export async function applyWorkflowCommand(team: EnsembleTeam, workflow: Managed
       workflow.state = Object.keys(workflow.blockers).length ? 'BLOCKED' : 'REVIEW'
       if (workflow.staged && workflow.state === 'REVIEW' &&
           Object.values(workflow.taskOwners).every(owner => Object.hasOwn(workflow.submitted, owner))) {
-        workflow.phaseDeadline = new Date(Date.now() + (workflow.stagedConfig?.verifyTimeoutMs ?? 120_000)).toISOString()
+        setReviewDeadline(workflow)
       }
       return `${actor.name} submitted work for review`
     case 'accept':
@@ -189,36 +194,57 @@ export async function applyWorkflowCommand(team: EnsembleTeam, workflow: Managed
       mustBeLead()
       if (workflow.state !== 'ACCEPTED' || !workflow.acceptance?.passed) throw new Error('Successful acceptance is required')
       const report = text(event.report)
-      if (workflow.baseline && snapshot(cwd, workflow.baseline).digest !== workflow.acceptance.digest) {
+      if (!acceptanceStillCurrent(team, workflow)) {
         workflow.state = 'REVIEW'
         workflow.acceptance = undefined
         return 'Workflow command rejected: Git state changed after acceptance'
       }
       workflow.report = report
       workflow.phaseDeadline = undefined
-      workflow.state = 'DONE'
+      workflow.state = 'CLOSING'
       return 'Lead filed the final report'
     }
     default: throw new Error('Unknown workflow action')
   }
 }
 
+function setReviewDeadline(workflow: ManagedWorkflow): void {
+  workflow.phaseDeadline = new Date(Date.now() + (workflow.stagedConfig?.verifyTimeoutMs ?? 120_000)).toISOString()
+}
+
+function verifyIntegratedWorktrees(team: EnsembleTeam, cwd: string): void {
+  for (const agent of team.agents) {
+    if (!agent.worktreePath || agent.worktreePath === cwd || agent.status === 'replaced') continue
+    const head = git(agent.worktreePath, 'rev-parse', 'HEAD').toString().trim()
+    if (git(agent.worktreePath, 'status', '--porcelain').length) {
+      throw new Error(`Integrate and clean ${agent.name}'s worktree before acceptance`)
+    }
+    try { git(cwd, 'merge-base', '--is-ancestor', head, 'HEAD') }
+    catch { throw new Error(`Integrate ${agent.name}'s committed work into the review branch before acceptance`) }
+  }
+}
+
+export function acceptanceStillCurrent(team: EnsembleTeam, workflow: ManagedWorkflow): boolean {
+  if (!workflow.acceptance?.passed) return false
+  if (!workflow.baseline) return true
+  try {
+    const cwd = team.worktreePath || team.workingDirectory || process.cwd()
+    verifyIntegratedWorktrees(team, cwd)
+    return snapshot(cwd, workflow.baseline).digest === workflow.acceptance.digest
+  } catch {
+    return false
+  }
+}
+
 async function checkAcceptance(team: EnsembleTeam, workflow: ManagedWorkflow, analysisOnly: boolean, signal?: AbortSignal): Promise<NonNullable<ManagedWorkflow['acceptance']>> {
   const config = readEnsembleConfig()
   const cwd = team.worktreePath || team.workingDirectory || process.cwd()
-  if (team.agents.some(agent => agent.worktreePath && agent.worktreePath !== cwd && agent.status !== 'replaced')) {
-    for (const agent of team.agents) {
-      if (!agent.worktreePath || agent.worktreePath === cwd || agent.status === 'replaced') continue
-      const head = git(agent.worktreePath, 'rev-parse', 'HEAD').toString().trim()
-      if (git(agent.worktreePath, 'status', '--porcelain').length) {
-        throw new Error(`Integrate and clean ${agent.name}'s worktree before acceptance`)
-      }
-      try { git(cwd, 'merge-base', '--is-ancestor', head, 'HEAD') }
-      catch { throw new Error(`Integrate ${agent.name}'s committed work into the review branch before acceptance`) }
-    }
-  }
+  verifyIntegratedWorktrees(team, cwd)
   const checks = config.acceptanceChecks ?? []
   const baseline = workflow.baseline
+  if (workflow.requireRegression && (!baseline || !checks.some(check => check.regression))) {
+    throw new Error('This task requires a configured regression check against a Git baseline')
+  }
   const before = baseline ? snapshot(cwd, baseline) : { head: '', digest: '', diff: '', changed: [], newFiles: [] }
   if (!baseline && !checks.length && !analysisOnly) throw new Error('Configure acceptanceChecks or explicitly accept an analysis-only result')
   if (checks.some(check => check.regression) && !baseline) throw new Error('Regression checks require a Git baseline')

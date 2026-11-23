@@ -6,6 +6,8 @@
 import http from 'http'
 import { timingSafeEqual, createHash } from 'crypto'
 import { isIP } from 'net'
+import { authenticateAgent } from './lib/agent-credentials'
+import { forwardedClientIp, normalizeIp } from './lib/ip-address'
 import fs from 'fs'
 import os from 'os'
 // Alias, want de request-handler gebruikt de naam `path` al voor de URL-pathname.
@@ -17,7 +19,6 @@ if (token && !/^[!-~]+$/.test(token)) {
   console.error('[Ensemble] ENSEMBLE_API_TOKEN must be a single printable token')
   process.exit(1)
 }
-const normalizeIp = (ip: string) => ip.replace(/^::ffff:/, '')
 const isLoopback = (ip: string) => ip === 'localhost' || ip === '::1' || /^127\./.test(ip) && isIP(ip) === 4
 const trustedProxies = new Set((process.env.ENSEMBLE_TRUSTED_PROXIES || '').split(',').map(ip => normalizeIp(ip.trim())).filter(ip => isIP(ip)))
 if (!isLoopback(normalizeIp(HOST)) &&
@@ -121,12 +122,7 @@ async function readBody(req: http.IncomingMessage): Promise<string> {
 }
 
 function getClientIp(req: http.IncomingMessage): string {
-  const peer = normalizeIp(req.socket.remoteAddress || 'unknown')
-  const forwarded = req.headers['x-forwarded-for']
-  if (!trustedProxies.has(peer) || typeof forwarded !== 'string') return peer
-  const chain = forwarded.split(',').map(item => normalizeIp(item.trim()))
-  if (!chain.every(ip => isIP(ip))) return peer
-  return chain.reverse().find(ip => !trustedProxies.has(ip)) || peer
+  return forwardedClientIp(normalizeIp(req.socket.remoteAddress || 'unknown'), req.headers['x-forwarded-for'], trustedProxies)
 }
 
 function isRateLimited(ip: string): boolean {
@@ -195,13 +191,21 @@ const server = http.createServer(async (req, res) => {
     // team-read.sh raakt de feed op het tempo van de agent. De lijst-route
     // (GET /api/ensemble/teams) en alle mutaties blijven gewoon gelimiteerd.
     const isTeamPoll = method === 'GET' && /^\/api\/ensemble\/teams\/[^/]+(?:\/feed)?$/.test(path)
-    if (!isTeamPoll && isRateLimited(getClientIp(req))) {
-      return json(res, { error: 'Rate limit exceeded' }, 429, origin)
-    }
-
     const peer = normalizeIp(req.socket.remoteAddress || 'unknown')
     const publicRequest = !isLoopback(peer) || trustedProxies.has(peer)
-    if (path.startsWith('/api/ensemble/') && (method !== 'GET' || publicRequest) && !isAuthorized(req)) {
+    const scopedRoute = path.match(/^\/api\/ensemble\/teams\/([^/]+)(\/feed)?$/)
+    const agentAuth = req.headers.authorization?.startsWith('Bearer agent.') && !(authDigest && isAuthorized(req))
+    const scopedAgent = agentAuth && scopedRoute && ((method === 'GET' && scopedRoute[2]) || (method === 'POST' && !scopedRoute[2]))
+      ? authenticateAgent(scopedRoute[1], req.headers.authorization) : undefined
+
+    if (!isTeamPoll) {
+      const ip = getClientIp(req)
+      const key = scopedAgent && scopedRoute ? JSON.stringify([ip, scopedRoute[1], scopedAgent]) : ip
+      if (isRateLimited(key)) return json(res, { error: 'Rate limit exceeded' }, 429, origin)
+    }
+    if (path.startsWith('/api/ensemble/') && (agentAuth
+      ? !scopedAgent
+      : (method !== 'GET' || publicRequest) && !isAuthorized(req))) {
       return json(res, { error: 'Unauthorized' }, 401, origin)
     }
 
@@ -242,7 +246,7 @@ const server = http.createServer(async (req, res) => {
           return json(res, { error: 'Bad Request: malformed JSON' }, 400, origin)
         }
         if (!body || typeof body !== 'object' || Array.isArray(body)) return json(res, { error: 'Invalid message' }, 400, origin)
-        const result = await sendTeamMessage(teamId, (body.to as string) || 'team', body.content as string, body.from as string, body.id as string, body.timestamp as string, body.priority === 'urgent' ? 'urgent' : 'normal')
+        const result = await sendTeamMessage(teamId, (body.to as string) || 'team', body.content as string, body.from as string, body.id as string, body.timestamp as string, body.priority === 'urgent' ? 'urgent' : 'normal', scopedAgent)
         if (result.error) return json(res, { error: result.error }, result.status, origin)
         return json(res, result.data, result.status, origin)
       }
@@ -265,7 +269,7 @@ const server = http.createServer(async (req, res) => {
     const feedMatch = path.match(/^\/api\/ensemble\/teams\/([^/]+)\/feed$/)
     if (feedMatch && method === 'GET') {
       const since = url.searchParams.get('since') || undefined
-      const result = getTeamFeed(feedMatch[1], since, url.searchParams.get('recipient') || undefined)
+      const result = getTeamFeed(feedMatch[1], since, url.searchParams.get('recipient') || undefined, scopedAgent)
       if (result.error) return json(res, { error: result.error }, result.status, origin)
       return json(res, result.data, result.status, origin)
     }
@@ -296,7 +300,7 @@ server.listen(PORT, HOST, () => {
 for (const signal of ['SIGINT', 'SIGTERM'] as const) {
   process.once(signal, () => {
     server.close()
-    server.closeIdleConnections()
-    setTimeout(() => server.closeAllConnections(), 5000).unref()
+    server.closeIdleConnections?.()
+    setTimeout(() => server.closeAllConnections?.(), 5000).unref()
   })
 }

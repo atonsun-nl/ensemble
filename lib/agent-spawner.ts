@@ -4,7 +4,7 @@
  * Handles: tmux session creation, program launching, and session cleanup.
  */
 
-import { v4 as uuidv4 } from 'uuid'
+import { randomUUID } from 'crypto'
 import path from 'path'
 import fs from 'fs'
 import os from 'os'
@@ -38,6 +38,7 @@ interface SpawnAgentOptions {
   workingDirectory: string
   hostId?: string
   prepared?: PreparedAgent
+  agentEnvironment?: Record<string, string>
 }
 
 /** Compute tmux session name from agent name */
@@ -84,7 +85,7 @@ export async function prepareLocalAgent(program: string, cwd: string): Promise<P
  */
 export async function spawnLocalAgent(options: SpawnAgentOptions): Promise<SpawnedAgent> {
   const runtime = getRuntime()
-  const agentId = uuidv4()
+  const agentId = randomUUID()
   const sessionName = computeSessionName(options.name)
   const cwd = options.workingDirectory || process.cwd()
   const hostId = options.hostId || getSelfHostId()
@@ -94,7 +95,7 @@ export async function spawnLocalAgent(options: SpawnAgentOptions): Promise<Spawn
   const launchFile = path.join(launchDir, 'start')
   let started = false
   try {
-    const entries = Object.entries(env).map(([key, value]) => `export ${key}=${shellEscape(value)}`)
+    const entries = Object.entries({ ...env, ...options.agentEnvironment }).map(([key, value]) => `export ${key}=${shellEscape(value)}`)
     fs.writeFileSync(launchFile, [...entries, 'exec 3<&-', `exec ${startCommand.map(shellEscape).join(' ')}`, ''].join('\n'), { mode: 0o600 })
     // Open the private file before unlinking it. The pane command line contains
     // only the file path, and exec leaves no interactive shell after CLI exit.
@@ -142,6 +143,7 @@ export async function spawnRemoteAgent(
   cwd: string,
   taskDescription?: string,
   teamName?: string,
+  options: { environment?: Record<string, string>; onCreated?: (id: string) => void } = {},
 ): Promise<{ id: string }> {
   // Create agent on remote host (15s timeout)
   const createCtrl = new AbortController()
@@ -157,7 +159,9 @@ export async function spawnRemoteAgent(
         workingDirectory: cwd,
         taskDescription,
         team: teamName,
+        environment: options.environment,
       }),
+      redirect: 'error',
       signal: createCtrl.signal,
     })
   } finally {
@@ -169,12 +173,15 @@ export async function spawnRemoteAgent(
   }
 
   const { agent } = await createRes.json()
+  const id = agent?.id
+  if (typeof id !== 'string' || !id) throw new Error('Remote agent creation returned no ID')
+  options.onCreated?.(id)
 
   // Wake agent on remote host (15s timeout)
   const wakeCtrl = new AbortController()
   const wakeTimer = setTimeout(() => wakeCtrl.abort(), 15000)
   try {
-    const wakeRes = await fetch(`${hostUrl}/api/agents/${agent.id}/wake`, {
+    const wakeRes = await fetch(`${hostUrl}/api/agents/${encodeURIComponent(id)}/wake`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ startProgram: true, sessionIndex: 0 }),
@@ -187,23 +194,40 @@ export async function spawnRemoteAgent(
     clearTimeout(wakeTimer)
   }
 
-  return { id: agent.id }
+  return { id }
+}
+
+/** Look up a reserved name when the create response was lost before recording its ID. */
+export async function findRemoteAgent(hostUrl: string, name: string): Promise<string | null | undefined> {
+  try {
+    const response = await fetch(`${hostUrl}/api/agents`, {
+      headers: { Accept: 'application/json' }, cache: 'no-store', signal: AbortSignal.timeout(5000),
+    })
+    if (!response.ok) return undefined
+    const body = await response.json()
+    const agents = Array.isArray(body) ? body : body?.agents
+    if (!Array.isArray(agents)) return undefined
+    const matches = agents.filter(agent => agent?.name === name)
+    if (!matches.length) return null
+    if (matches.length === 1 && typeof matches[0].id === 'string' && matches[0].id) return matches[0].id
+  } catch { /* An unreachable host does not establish absence. */ }
 }
 
 /**
  * Kill a remote agent via Maestro API
  */
-export async function killRemoteAgent(hostUrl: string, agentId: string): Promise<void> {
+export async function killRemoteAgent(hostUrl: string, agentId: string): Promise<boolean> {
   const ctrl = new AbortController()
   const timer = setTimeout(() => ctrl.abort(), 10000)
   try {
-    await fetch(`${hostUrl}/api/agents/${agentId}`, {
+    const response = await fetch(`${hostUrl}/api/agents/${encodeURIComponent(agentId)}`, {
       method: 'DELETE',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ killSession: true }),
       signal: ctrl.signal,
     })
-  } catch { /* non-fatal */ }
+    return response.ok || response.status === 404
+  } catch { return false }
   finally { clearTimeout(timer) }
 }
 
@@ -264,7 +288,7 @@ export async function getAgentTokenUsage(sessionName: string): Promise<string> {
 /**
  * Check if a remote session exists and is ready
  */
-export async function isRemoteSessionReady(hostUrl: string, sessionName: string, readyMarker?: string): Promise<boolean | undefined> {
+export async function isRemoteSessionReady(hostUrl: string, sessionName: string, check?: string | { foreground: true; allowUnknown?: boolean }): Promise<boolean | undefined> {
   const ctrl = new AbortController()
   const timer = setTimeout(() => ctrl.abort(), 5000)
   try {
@@ -277,10 +301,15 @@ export async function isRemoteSessionReady(hostUrl: string, sessionName: string,
     if (response.status === 404) return false
     if (!response.ok) return undefined
     const body = await response.json().catch(() => null)
-    if (typeof body?.exists !== 'boolean' || !body.exists || readyMarker === undefined) return body?.exists === false ? false : body?.exists === true ? true : undefined
+    if (typeof body?.exists !== 'boolean') return undefined
+    if (!body.exists || check === undefined) return body.exists
     const foreground = body.foregroundCommand
-    return typeof foreground === 'string' && !!foreground && !isShellCommand(foreground) &&
-      (body.ready === true || (typeof body.output === 'string' && body.output.includes(readyMarker)))
+    if (typeof foreground !== 'string' || !foreground.trim()) {
+      return typeof check === 'string' ? false : check.allowUnknown ? true : undefined
+    }
+    if (isShellCommand(foreground)) return false
+    return typeof check === 'object' || body.ready === true ||
+      (typeof body.output === 'string' && body.output.includes(check))
   } catch {
     return undefined
   } finally {

@@ -2,7 +2,7 @@ import fs from 'node:fs'
 import { createRequire } from 'node:module'
 import { stripVTControlCharacters } from 'node:util'
 import ts from 'typescript'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import * as agentConfig from '../lib/agent-config'
 
 interface Message {
@@ -21,6 +21,10 @@ interface TestMonitor {
   renderHeader(width: number): string
   renderInlineSummary(width: number, maxLines: number): string
   getLastAgentMessageTime(): number
+  disbandTeam(): Promise<void>
+  renderFooter(width: number): string
+  render(): void
+  cleanup(): void
 }
 
 // De CLI start main() bij import. Laad de echte klasse, maar sla uitsluitend
@@ -110,4 +114,24 @@ describe('monitor tijdlijn', () => {
     instance.scrollOffset = 3
     expect(visibleLines(instance.renderMessages(55, 3))).toEqual(all.slice(-6, -3))
   })
+})
+
+it('shows HTTP 401 and leaves the monitor open after a rejected disband', async () => {
+  const instance = monitor()
+  const output = vi.spyOn(instance, 'render').mockImplementation(() => {})
+  const cleanup = vi.spyOn(instance, 'cleanup').mockImplementation(() => {})
+  const exit = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never)
+  const fetch = vi.spyOn(globalThis, 'fetch')
+    .mockResolvedValueOnce(new Response('{"messages":[]}', { status: 200 }))
+    .mockResolvedValueOnce(new Response('{"error":"Unauthorized"}', { status: 401, statusText: 'Unauthorized' }))
+  try {
+    await instance.disbandTeam()
+    expect(cleanup).not.toHaveBeenCalled()
+    expect(exit).not.toHaveBeenCalled()
+    expect(output).toHaveBeenCalled()
+    expect(stripVTControlCharacters(instance.renderFooter(120))).toContain('HTTP 401')
+  } finally {
+    fetch.mockRestore()
+    exit.mockRestore()
+  }
 })

@@ -1,4 +1,4 @@
-import { v4 as uuidv4 } from 'uuid'
+import { randomUUID } from 'crypto'
 import { isShellCommand, type AgentRuntime } from './agent-runtime'
 import { pasteAgentInput } from './agent-input'
 import type { AgentProgram } from '../types/agent-program'
@@ -237,7 +237,7 @@ export class AgentWatchdog {
               nudgeBudgetSpentAt: new Date(nowMs).toISOString(),
             })
             this.deps.appendMessage(team.id, {
-              id: uuidv4(),
+              id: randomUUID(),
               teamId: team.id,
               from: 'ensemble',
               to: 'team',
@@ -285,7 +285,7 @@ export class AgentWatchdog {
           // stay quiet, because it is the same failure and the feed is the archive.
           if (failedNudges === 1 || givingUp) {
             this.deps.appendMessage(team.id, {
-              id: uuidv4(),
+              id: randomUUID(),
               teamId: team.id,
               from: 'ensemble',
               to: 'team',
@@ -314,7 +314,7 @@ export class AgentWatchdog {
       this.deps.onAgentStalled?.(team, agent, 'Agent stalled after watchdog nudge')
       console.warn(`[Watchdog] Agent ${agent.name} in team ${team.id} stalled after watchdog nudge`)
       this.deps.appendMessage(team.id, {
-        id: uuidv4(),
+        id: randomUUID(),
         teamId: team.id,
         from: 'ensemble',
         to: 'team',
@@ -341,7 +341,7 @@ export class AgentWatchdog {
     }
     agent.status = 'failed'
     this.deps.markAgentFailed?.(team.id, agent.name)
-    this.deps.appendMessage(team.id, { id: uuidv4(), teamId: team.id, from: 'ensemble', to: 'team', type: 'chat', timestamp: new Date(this.now()).toISOString(), content: `Agent ${agent.name} failed: ${detail}; no replacement available` })
+    this.deps.appendMessage(team.id, { id: randomUUID(), teamId: team.id, from: 'ensemble', to: 'team', type: 'chat', timestamp: new Date(this.now()).toISOString(), content: `Agent ${agent.name} failed: ${detail}; no replacement available` })
     await this.reportIfTeamUnreachable(team)
   }
 
@@ -369,7 +369,7 @@ export class AgentWatchdog {
   private async nudgeAgent(team: EnsembleTeam, agentName: string, program: string, hostId?: string): Promise<void> {
     const timestamp = new Date(this.now()).toISOString()
     this.deps.appendMessage(team.id, {
-      id: uuidv4(),
+      id: randomUUID(),
       teamId: team.id,
       from: 'ensemble',
       to: 'team',

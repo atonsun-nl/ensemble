@@ -87,7 +87,10 @@ it('bounds the post-exit stdout drain at 500ms', async () => {
 })
 
 async function helperProcess(entry: string, env: Record<string, string>, limitMs: number) {
-  const child = spawn(process.execPath, ['--import', path.resolve('node_modules/tsx/dist/loader.mjs'), entry, 'codex', '1'], {
+  const runner = process.allowedNodeEnvironmentFlags.has('--import')
+    ? ['--import', path.resolve('node_modules/tsx/dist/loader.mjs')]
+    : [path.resolve('node_modules/tsx/dist/cli.mjs')]
+  const child = spawn(process.execPath, [...runner, entry, 'codex', '1'], {
     env: { ...process.env, ...env, NODE_NO_WARNINGS: '1' }, stdio: ['ignore', 'pipe', 'pipe'],
   })
   let stdout = ''

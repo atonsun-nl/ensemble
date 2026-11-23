@@ -4,7 +4,7 @@
  * Uses agent-spawner.ts for local/remote agent lifecycle.
  */
 
-import { v4 as uuidv4 } from 'uuid'
+import { randomUUID } from 'crypto'
 import type { EnsembleTeam, EnsembleMessage, CreateTeamRequest, CollabTemplatesFile } from '../types/ensemble'
 import {
   createTeam, getTeam, updateTeam, loadTeams,
@@ -33,7 +33,8 @@ import path from 'path'
 import { fileURLToPath } from 'url'
 import { execFileSync } from 'child_process'
 import { createTeamWorktree, createWorktree, mergeWorktree, destroyWorktree, type WorktreeInfo } from '../lib/worktree-manager'
-import { applyWorkflowCommand, isWorkflowCommand, readBaseline, receiptPrefix } from '../lib/managed-workflow'
+import { issueAgentEnvironment } from '../lib/agent-credentials'
+import { acceptanceStillCurrent, applyWorkflowCommand, isWorkflowCommand, readBaseline, receiptPrefix } from '../lib/managed-workflow'
 import { readEnsembleConfig } from '../lib/ensemble-config'
 import { emitEvent, runPlan, type BrainEvent } from '../lib/brain-hooks'
 import { replaceTeamAgent, recoverPendingReplacement, stopTeamReplacements } from '../lib/agent-replacement'
@@ -132,7 +133,7 @@ class EnsembleService {
     try {
       console.warn(`[Ensemble] Team ${teamId} unreachable: ${reason}`)
       appendMessage(teamId, {
-        id: uuidv4(),
+        id: randomUUID(),
         teamId,
         from: 'ensemble',
         to: 'team',
@@ -156,12 +157,14 @@ class EnsembleService {
       if (!activeIds.has(id)) this.deadlineWarnings.delete(id)
     }
     const config = readEnsembleConfig()
-    for (const team of teams) {
-      if (this.disbandingTeams.has(team.id) || startingTeams.has(team.id) || lifecycleWork.has(team.id)) continue
-      this.disbandingTeams.add(team.id)
+    for (const { id } of teams) {
+      if (this.disbandingTeams.has(id) || startingTeams.has(id) || lifecycleWork.has(id)) continue
+      this.disbandingTeams.add(id)
       try {
+        const team = getTeam(id)
+        if (!team || team.status === 'disbanded' || team.status === 'failed' || team.status === 'paused') continue
         if (team.status === 'completed') {
-          await disbandTeam(team.id, team.failureReason, team.workflow?.state === 'DONE' ? 'ok' : undefined)
+          await disbandTeam(team.id, team.failureReason, team.workflow?.state === 'CLOSING' || team.workflow?.state === 'DONE' ? 'ok' : undefined)
           continue
         }
         if (team.status === 'forming') {
@@ -171,7 +174,7 @@ class EnsembleService {
         if (team.workflow) {
           await processManagedTeam(team)
           if (getTeam(team.id)?.status !== 'active') continue
-          if (team.workflow.state === 'DONE') {
+          if (team.workflow.state === 'CLOSING' || team.workflow.state === 'DONE') {
             await disbandTeam(team.id, undefined, 'ok')
             continue
           }
@@ -216,7 +219,7 @@ class EnsembleService {
               try {
                 const reason = `team stopped on time limit after ${formatDuration(ageMs)}`
                 appendMessage(team.id, {
-                  id: uuidv4(), teamId: team.id, from: 'ensemble', to: 'team',
+                  id: randomUUID(), teamId: team.id, from: 'ensemble', to: 'team',
                   content: 'Team ended after its configured deadline and grace period',
                   type: 'chat', timestamp: new Date().toISOString(),
                 })
@@ -224,7 +227,7 @@ class EnsembleService {
               } catch (error) {
                 console.error(`[Ensemble] Time-limit disband failed for ${team.id}:`, error)
               } finally {
-                this.disbandingTeams.delete(team.id)
+                this.disbandingTeams.delete(id)
                 this.deadlineWarnings.delete(team.id)
               }
               continue
@@ -247,9 +250,9 @@ class EnsembleService {
           await disbandTeam(team.id, undefined, 'ok')
         }
       } catch (error) {
-        console.error(`[Ensemble] Lifecycle check failed for ${team.id}:`, error)
+        console.error(`[Ensemble] Lifecycle check failed for ${id}:`, error)
       } finally {
-        this.disbandingTeams.delete(team.id)
+        this.disbandingTeams.delete(id)
       }
     }
   }
@@ -461,7 +464,7 @@ export function buildPromptPreview(params: {
     `Task: ${params.description}`,
     template?.roles[params.agentIndex]?.focus || '',
     params.staged ? 'Staged workflow: plan, implement, then review the diff and run the acceptance checks.' : '',
-    `Share decisions, actionable findings and blockers with ${say} "message". Read new messages with ${read} at task boundaries, and use --all to review the history. Messages do not request an acknowledgement by default.`,
+    `Share decisions, actionable findings and blockers with ${say} "message". Read new messages with ${read} at task boundaries, and use --all to review the history. After processing a message, acknowledge its ID with ${read} --ack ID. Messages do not request an acknowledgement by default.`,
     'Send a workflow event with team-say and one quoted argument of the form <<COLLAB_EVENT>> followed by a JSON object.',
     lead
       ? [
@@ -470,7 +473,7 @@ export function buildPromptPreview(params: {
           'Approve critical changes with {"action":"change","paths":["..."],"test":"...","counterexample":"..."}. Record decisions with {"action":"decision","decision":"..."}.',
           'Review the Git diff and submissions. Submit Lead work with {"action":"submit","report":"..."}, request machine acceptance with {"action":"accept"}, and wait for its result. After acceptance passes, file the final report once with {"action":"close","report":"..."}.',
         ].join(' ')
-      : 'Read the acknowledged Lead plan and wait for an assignment naming you before editing. Edit only paths assigned to you. When ready for Lead review, send {"action":"submit","report":"Changes, tests and remaining risks"}.',
+      : 'Read the acknowledged Lead plan. Wait for an Assignment confirmed or Assignment takeover confirmed notification from ensemble naming you before editing. Process any newer release or takeover first. Edit only paths assigned to you. When ready for Lead review, send {"action":"submit","report":"Changes, tests and remaining risks"}.',
     `While awaiting a plan acknowledgement, assignment, or review result, keep your turn active and use ${read} --wait. Repeat until the requested workflow event arrives. Workers stay available for review feedback until acceptance. The Lead can end its turn after filing the final report.`,
     'Use {"action":"block","reason":"..."} to raise a blocker and {"action":"unblock"} when it is resolved. Commits require explicit operator policy.',
     'Optionally record a long tool call with {"action":"activity","state":"busy","tool":"tool name"} and send state "idle" at its next safe boundary.',
@@ -549,6 +552,7 @@ export async function createEnsembleTeam(
   if (!request || typeof request.name !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,79}$/.test(request.name) ||
       typeof request.description !== 'string' || !request.description.trim() ||
       (request.workingDirectory !== undefined && typeof request.workingDirectory !== 'string') ||
+      (request.requireRegression !== undefined && typeof request.requireRegression !== 'boolean') ||
       (request.requireLeadReady !== undefined && typeof request.requireLeadReady !== 'boolean') ||
       (request.stagedConfig !== undefined &&
         (!request.stagedConfig || typeof request.stagedConfig !== 'object' || Array.isArray(request.stagedConfig) ||
@@ -597,7 +601,7 @@ export async function createEnsembleTeam(
     const worktreeMap = new Map<string, WorktreeInfo>()
 
     if (plan) appendMessage(team.id, {
-      id: uuidv4(), teamId: team.id, from: 'ensemble', to: 'team', type: 'chat', timestamp: new Date().toISOString(),
+      id: randomUUID(), teamId: team.id, from: 'ensemble', to: 'team', type: 'chat', timestamp: new Date().toISOString(),
       content: `Brain plan: ${plan.agents.join(', ')}; template: ${request.templateName || 'default'}; reason: ${plan.reason || 'not provided'}`,
     })
     if (request.worktree === 'team') {
@@ -628,7 +632,7 @@ export async function createEnsembleTeam(
             team.agents[i].worktreePath = worktreeInfo.path
             team.agents[i].worktreeBranch = worktreeInfo.branch
             appendMessage(team.id, {
-              id: uuidv4(), teamId: team.id, from: 'ensemble', to: 'team',
+              id: randomUUID(), teamId: team.id, from: 'ensemble', to: 'team',
               content: `🌳 Worktree created for ${agentSpec.name}: ${worktreeInfo.branch}`,
               type: 'chat', timestamp: new Date().toISOString(),
             })
@@ -636,7 +640,7 @@ export async function createEnsembleTeam(
             const message = err instanceof Error ? err.message : String(err)
             console.error(`[Ensemble] Failed to create worktree for ${agentSpec.name}:`, message)
             appendMessage(team.id, {
-              id: uuidv4(), teamId: team.id, from: 'ensemble', to: 'team',
+              id: randomUUID(), teamId: team.id, from: 'ensemble', to: 'team',
               content: `⚠️ Worktree creation failed for ${agentSpec.name}: ${message}. Using shared directory.`,
               type: 'chat', timestamp: new Date().toISOString(),
             })
@@ -657,7 +661,7 @@ export async function createEnsembleTeam(
     const requireLeadReady = request.requireLeadReady ?? team.agents.length > 1
     const lead = team.agents[leadIndex]
     team.workflow = {
-      state: 'STARTING', requireLeadReady, lead: lead.name, staged: request.staged, stagedConfig: request.stagedConfig,
+      state: 'STARTING', requireLeadReady, requireRegression: request.requireRegression, lead: lead.name, staged: request.staged, stagedConfig: request.stagedConfig,
       startupDeadline: new Date(Date.now() + (request.stagedConfig?.planTimeoutMs ?? 120_000)).toISOString(),
       baseline: readBaseline(team.worktreePath || cwd),
       fileOwners: {}, taskOwners: {}, submitted: {}, blockers: {}, decisions: [], approvedChanges: [], handled: [],
@@ -683,19 +687,29 @@ export async function createEnsembleTeam(
       const { hostId, workingDirectory, prepared } = launches[index]
       const name = `${team.name}-${agent.name}`
       try {
+        const agentEnvironment = issueAgentEnvironment(team.id, agent.name)
         if (isSelf(hostId)) {
           if (team.worktreePath) {
             agent.worktreePath = team.worktreePath
             agent.worktreeBranch = team.worktreeBranch
           }
-          const spawned = await spawnLocalAgent({ name, program: agent.program, workingDirectory, hostId, ...(prepared ? { prepared } : {}) })
+          const spawned = await spawnLocalAgent({ name, program: agent.program, workingDirectory, hostId, agentEnvironment, ...(prepared ? { prepared } : {}) })
           agent.agentId = spawned.id
           agent.sessionName = spawned.sessionName || name
         } else {
           const host = getHostById(hostId)
           if (!host) throw new Error('Configured remote host is unavailable')
           // Do not send the task description through Maestro before the plan gate.
-          const spawned = await spawnRemote(host.url, name, agent.program, cwd, undefined, team.name)
+          const spawned = await spawnRemote(host.url, name, agent.program, cwd, undefined, team.name, {
+            environment: agentEnvironment,
+            onCreated: id => {
+              agent.agentId = id
+              agent.sessionName = name
+              agent.hostId = hostId
+              agent.startup = 'session_created'
+              updateTeam(team.id, { agents: team.agents })
+            },
+          })
           agent.agentId = spawned.id
           agent.sessionName = name
         }
@@ -742,8 +756,14 @@ export async function createEnsembleTeam(
 
 const startingTeams = new Set<string>()
 
-function recordSystemMessage(teamId: string, content: string): void {
-  appendMessage(teamId, { id: uuidv4(), teamId, from: 'ensemble', to: 'team', content, type: 'chat', timestamp: new Date().toISOString() })
+function recordSystemMessage(teamId: string, content: string, id: string = randomUUID()): void {
+  if (getMessages(teamId, undefined, 'queue').some(message => message.id === id)) return
+  const timestamp = new Date().toISOString()
+  const team = getTeam(teamId)
+  const delivery = team?.workflow ? team.agents
+    .filter(agent => agent.status === 'active')
+    .map(agent => ({ recipient: agent.name, status: 'queued' as const, at: timestamp, method: 'pull' as const })) : undefined
+  appendMessage(teamId, { id, teamId, from: 'ensemble', to: 'team', content, type: 'chat', timestamp, delivery })
 }
 
 async function stopAgent(team: EnsembleTeam, agent: EnsembleTeam['agents'][number]): Promise<void> {
@@ -753,35 +773,55 @@ async function stopAgent(team: EnsembleTeam, agent: EnsembleTeam['agents'][numbe
   } else await killLocalAgent(agent.sessionName || `${team.name}-${agent.name}`)
 }
 
-async function deliverInitialPrompt(team: EnsembleTeam, agent: EnsembleTeam['agents'][number], templateName?: string): Promise<void> {
+async function deliverInitialPrompt(team: EnsembleTeam, agent: EnsembleTeam['agents'][number], templateName?: string, checkLead = false): Promise<void> {
   const sessionName = agent.sessionName || `${team.name}-${agent.name}`
   const runtime = getRuntime()
-  const prompt = buildPromptPreview({
+  let prompt = buildPromptPreview({
     teamId: team.id, teamName: team.name, description: team.description, agentName: agent.name,
     teammateNames: team.agents.filter(other => other !== agent && other.status !== 'failed').map(other => other.name),
     agentIndex: team.agents.indexOf(agent), role: agent.role, templateName, staged: team.workflow?.staged,
   })
   const promptFile = collabPromptFile(team.id, agent.name)
+  if (fs.existsSync(promptFile)) prompt += `\n\nReplacement context from Ensemble:\n${fs.readFileSync(promptFile, 'utf8')}`
   fs.writeFileSync(promptFile, prompt, { mode: 0o600 })
+  const beforeSend = async () => {
+    if (checkLead && !await leadReadyForDispatch(team.id)) return false
+    agent.startup = 'prompt_sending'
+    updateTeam(team.id, { agents: team.agents })
+    return true
+  }
   if (agent.hostId && !isSelf(agent.hostId)) {
     const host = getHostById(agent.hostId)
     if (!host) throw new Error('Configured remote host is unavailable')
+    if (!await beforeSend()) return
     await postRemoteSessionCommand(host.url, sessionName, prompt)
   } else {
     const config = resolveAgentProgram(agent.program)
-    if (config.inputMethod === 'pasteFromFile') await pasteAgentInput(runtime, sessionName, promptFile, prompt, config.pasteEnterCount)
-    else await runtime.sendKeys(sessionName, prompt.replace(/[\r\n]+/g, ' '), { literal: true, enter: true, agentInput: true })
+    if (config.inputMethod === 'pasteFromFile') {
+      if (!await pasteAgentInput(runtime, sessionName, promptFile, prompt, config.pasteEnterCount, beforeSend)) return
+    } else {
+      if (!await beforeSend()) return
+      await runtime.sendKeys(sessionName, prompt.replace(/[\r\n]+/g, ' '), { literal: true, enter: true, agentInput: true })
+    }
   }
   agent.startup = 'prompt_delivered'
   updateTeam(team.id, { agents: team.agents })
 }
 
+function flushWorkflowNotices(teamId: string, workflow: NonNullable<EnsembleTeam['workflow']>): void {
+  if (!workflow.pendingNotices?.length) return
+  for (const notice of workflow.pendingNotices) recordSystemMessage(teamId, notice.content, notice.id)
+  workflow.pendingNotices = undefined
+  updateTeam(teamId, { workflow })
+}
+
 async function processManagedTeam(team: EnsembleTeam): Promise<void> {
   let workflow = team.workflow!
-  if (workflow.state === 'DONE') return
+  flushWorkflowNotices(team.id, workflow)
+  if (workflow.state === 'CLOSING' || workflow.state === 'DONE') return
   const processed = new Set(workflow.handled)
-  for (const message of getMessages(team.id)) {
-    if (processed.has(message.id) || !message.content.startsWith('<<COLLAB_EVENT>> ')) continue
+  for (const message of getMessages(team.id, undefined, 'queue')) {
+    if (!message.authenticatedAgent || processed.has(message.id) || !message.content.startsWith('<<COLLAB_EVENT>> ')) continue
     const candidate = structuredClone(workflow)
     let response: string | undefined
     const controller = new AbortController()
@@ -797,10 +837,11 @@ async function processManagedTeam(team: EnsembleTeam): Promise<void> {
     workflow.handled.push(message.id)
     const latest = getTeam(team.id)
     if (!latest || latest.status !== 'active' || latest.workflow?.lead !== workflow.lead || lifecycleWork.has(team.id)) return
+    if (response) (workflow.pendingNotices ??= []).push({ id: randomUUID(), content: response })
     team.workflow = workflow
     updateTeam(team.id, { workflow })
-    if (response) recordSystemMessage(team.id, response)
-    if (team.workflow.state === 'DONE') return
+    flushWorkflowNotices(team.id, workflow)
+    if (team.workflow.state === 'CLOSING' || team.workflow.state === 'DONE') return
   }
   if (!await reconcileManagedAgents(team) || !workflow.plan) return
   for (const agent of team.agents) {
@@ -808,8 +849,10 @@ async function processManagedTeam(team: EnsembleTeam): Promise<void> {
     if (getTeam(team.id)?.status !== 'active' || lifecycleWork.has(team.id)) return
     try {
       if (!await waitForReady(agent.sessionName || `${team.name}-${agent.name}`, agent.program, agent.hostId, 5000, workflow.requireLeadReady)) throw new Error('Worker CLI is no longer ready')
-      await deliverInitialPrompt(team, agent, team.templateName)
+      await deliverInitialPrompt(team, agent, team.templateName, true)
+      if (agent.startup === 'cli_ready') return
     } catch (error) {
+      if (getTeam(team.id)?.status !== 'active' || lifecycleWork.has(team.id)) return
       await stopAgent(team, agent)
       agent.status = 'failed'
       updateTeam(team.id, { agents: team.agents })
@@ -818,8 +861,34 @@ async function processManagedTeam(team: EnsembleTeam): Promise<void> {
   }
 }
 
+async function agentProcessRunning(team: EnsembleTeam, agent: EnsembleTeam['agents'][number]): Promise<boolean | undefined> {
+  const session = agent.sessionName || `${team.name}-${agent.name}`
+  if (agent.hostId && !isSelf(agent.hostId)) {
+    const host = getHostById(agent.hostId)
+    return host ? isRemoteSessionReady(host.url, session, { foreground: true, allowUnknown: !team.workflow?.requireLeadReady }) : undefined
+  }
+  const runtime = getRuntime()
+  if (!await runtime.sessionExists(session)) return false
+  const foreground = await runtime.getForegroundCommand?.(session)
+  return foreground ? !isShellCommand(foreground) : undefined
+}
+
+async function leadReadyForDispatch(teamId: string): Promise<boolean> {
+  const current = getTeam(teamId)
+  if (!current?.workflow?.plan || current.status !== 'active' || lifecycleWork.has(teamId)) return false
+  const lead = current.agents.find(agent => agent.name === current.workflow!.lead && agent.status === 'active' && agent.startup === 'prompt_delivered')
+  const running = lead ? await agentProcessRunning(current, lead) : false
+  if (getTeam(teamId)?.status !== 'active' || lifecycleWork.has(teamId)) return false
+  if (running === false) await disbandTeam(teamId, 'Lead disappeared before worker prompt delivery')
+  return running === true
+}
+
 async function reconcileManagedAgents(team: EnsembleTeam): Promise<boolean> {
   const workflow = team.workflow!
+  if (team.agents.some(agent => agent.status === 'active' && agent.startup === 'prompt_sending')) {
+    await disbandTeam(team.id, 'Prompt delivery was interrupted before acknowledgement')
+    return false
+  }
   if (team.pendingReplacement) {
     if (!await recoverPendingReplacement(team.id, team.pendingReplacement)) {
       await disbandTeam(team.id, 'Could not confirm shutdown of a partially started replacement')
@@ -835,19 +904,10 @@ async function reconcileManagedAgents(team: EnsembleTeam): Promise<boolean> {
     return false
   }
   for (const agent of agents) {
-    const session = agent.sessionName || `${team.name}-${agent.name}`
-    const remote = agent.hostId && !isSelf(agent.hostId)
-    const host = remote ? getHostById(agent.hostId) : undefined
-    const exists = remote
-      ? host ? await isRemoteSessionReady(host.url, session) : undefined
-      : await getRuntime().sessionExists(session)
+    const running = await agentProcessRunning(team, agent)
     if (getTeam(team.id)?.status !== 'active' || lifecycleWork.has(team.id)) return false
-    if (exists === undefined && agent.name === workflow.lead) return false
-    let reason = exists === false ? 'session disappeared' : undefined
-    if (!remote && exists) {
-      const foreground = await getRuntime().getForegroundCommand?.(session)
-      if (foreground && isShellCommand(foreground)) reason = 'CLI exited to a shell'
-    }
+    if (running === undefined && agent.name === workflow.lead) return false
+    const reason = running === false ? 'session disappeared or CLI exited to a shell' : undefined
     if (!reason || (agent.name !== workflow.lead && workflow.submitted[agent.name])) continue
     if (agent.name === workflow.lead) {
       // Once workers have entered implementation their shells cannot be
@@ -860,11 +920,11 @@ async function reconcileManagedAgents(team: EnsembleTeam): Promise<boolean> {
     }
     if (await replaceTeamAgent(team.id, agent.name, reason, waitForReady)) return false
     if (getTeam(team.id)?.status !== 'active' || lifecycleWork.has(team.id)) return false
-    if (exists) await stopAgent(team, agent)
+    await stopAgent(team, agent)
     agent.status = 'failed'
     if (!workflow.submitted[agent.name]) {
       workflow.blockers[agent.name] = reason
-      workflow.state = 'BLOCKED'
+      if (workflow.plan) workflow.state = 'BLOCKED'
     }
     updateTeam(team.id, { agents: team.agents, workflow })
     recordSystemMessage(team.id, `Worker ${agent.name} failed: ${reason}. Lead can take over its assignment.`)
@@ -886,13 +946,18 @@ export async function checkIdleTeams(): Promise<void> {
   await ensembleService.checkIdleTeams()
 }
 
-export function getTeamFeed(teamId: string, since?: string, recipient?: string): ServiceResult<{ messages: EnsembleMessage[] }> {
+export function getTeamFeed(teamId: string, since?: string, recipient?: string, authenticatedAgent?: string): ServiceResult<{ messages: EnsembleMessage[] }> {
   const team = getTeam(teamId)
   if (!team) return { error: 'Team not found', status: 404 }
-  const messages = getMessages(teamId)
+  if (authenticatedAgent && (!team.workflow || !team.agents.some(agent =>
+    agent.name === authenticatedAgent && agent.status === 'active'))) {
+    return { status: 403, error: 'Agent credential is no longer active' }
+  }
+  const reader = authenticatedAgent ?? recipient
+  const messages = getMessages(teamId, undefined, team.workflow && reader ? 'queue' : 'timeline')
   const receipts = new Map<string, Map<string, string>>()
   for (const message of messages) {
-    if (!message.content.startsWith(receiptPrefix)) continue
+    if (!message.content.startsWith(receiptPrefix) || (team.workflow && !message.authenticatedAgent)) continue
     try {
       const ids: unknown = JSON.parse(message.content.slice(receiptPrefix.length))
       if (!Array.isArray(ids)) continue
@@ -900,30 +965,31 @@ export function getTeamFeed(teamId: string, since?: string, recipient?: string):
         if (typeof id !== 'string') continue
         if (!receipts.has(id)) receipts.set(id, new Map())
         const readers = receipts.get(id)!
-        if (!readers.has(message.from)) readers.set(message.from, message.timestamp)
+        const agent = message.authenticatedAgent ?? message.from
+        if (!readers.has(agent)) readers.set(agent, message.timestamp)
       }
-    } catch { /* Ignore malformed read receipts. */ }
+    } catch { /* Ignore malformed read receipts in old journals. */ }
   }
   return {
-    status: 200,
-    data: { messages: messages.filter(message =>
+    status: 200, data: { messages: messages.filter(message =>
       !message.content.startsWith(receiptPrefix) &&
       (!since || message.timestamp > since) &&
-      (!recipient || (message.from !== recipient && (message.to === recipient || message.to === 'team')))
+      (!reader || (team.workflow
+        ? !isWorkflowCommand(message.content) && message.delivery?.some(item => item.recipient === reader && item.method === 'pull')
+        : message.from !== reader && (message.to === reader || message.to === 'team')))
     ).map(message => {
+      if (!message.delivery) return message
       const readers = receipts.get(message.id)
-      const queued = message.delivery ?? (team.workflow ? team.agents
-        .filter(agent => agent.name !== message.from && (message.to === 'team' || message.to === agent.name))
-        .map(agent => ({ recipient: agent.name, status: 'queued' as const, at: message.timestamp, method: 'pull' as const })) : undefined)
-      if (!queued) return message
-      return { ...message, delivery: queued.map(delivery => {
-        const at = readers?.get(delivery.recipient)
-        if (at && delivery.method === 'pull') return { ...delivery, status: 'delivered' as const, at }
-        if (delivery.method === 'pane' && delivery.status === 'queued' && !pushing.has(`${teamId}:${message.id}`)) {
-          return { ...delivery, status: 'failed' as const, reason: 'Delivery interrupted or unconfirmed' }
-        }
-        return delivery
-      }) }
+      return { ...message, delivery: message.delivery
+        .filter(delivery => !authenticatedAgent || delivery.recipient === authenticatedAgent)
+        .map(delivery => {
+          const at = readers?.get(delivery.recipient)
+          if (at && delivery.method === 'pull') return { ...delivery, status: 'delivered' as const, at }
+          if (delivery.method === 'pane' && delivery.status === 'queued' && !pushing.has(`${teamId}:${message.id}`)) {
+            return { ...delivery, status: 'failed' as const, reason: 'Delivery interrupted or unconfirmed' }
+          }
+          return delivery
+        }) }
     }) },
   }
 }
@@ -932,7 +998,7 @@ const pushing = new Map<string, Promise<unknown>>()
 
 export async function sendTeamMessage(
   teamId: string, to: string, content: string, from?: string,
-  existingId?: string, existingTimestamp?: string, priority?: 'normal' | 'urgent',
+  existingId?: string, existingTimestamp?: string, priority?: 'normal' | 'urgent', authenticatedAgent?: string,
 ): Promise<ServiceResult<{ message: EnsembleMessage }>> {
   const team = getTeam(teamId)
   if (!team) return { error: 'Team not found', status: 404 }
@@ -941,26 +1007,43 @@ export async function sendTeamMessage(
       (existingId !== undefined && typeof existingId !== 'string')) {
     return { error: 'Invalid message', status: 400 }
   }
-  const sender = from || 'user'
-  const id = existingId || uuidv4()
+  const sender = authenticatedAgent || from || 'user'
+  if (team.workflow && ((authenticatedAgent && (from && from !== authenticatedAgent ||
+      !team.agents.some(agent => agent.name === authenticatedAgent && agent.status === 'active'))) ||
+      sender === 'ensemble' || (isWorkflowCommand(content) && !authenticatedAgent && content.trim() !== EXPLICIT_DONE_SENTINEL))) {
+    return { status: 403, error: 'An active agent credential is required for this sender or event' }
+  }
+  if (team.workflow && content.startsWith(receiptPrefix)) {
+    let ids: unknown
+    try { ids = JSON.parse(content.slice(receiptPrefix.length)) } catch { /* Invalid receipt. */ }
+    if (to !== 'ensemble' || !Array.isArray(ids) || !ids.length || ids.length > 100 ||
+        ids.some(id => typeof id !== 'string' || !id || id.length > 256)) {
+      return { status: 400, error: 'Invalid message acknowledgement' }
+    }
+    const inbox = new Set(getTeamFeed(teamId, undefined, authenticatedAgent).data?.messages.map(message => message.id))
+    if (ids.some(id => !inbox.has(id))) return { status: 403, error: 'Acknowledgement is outside this inbox' }
+  }
+  const id = existingId || randomUUID()
   const key = `${teamId}:${id}`
-  const original = existingId ? getMessages(teamId).find(message => message.id === existingId) : undefined
-  if (original && (original.from !== sender || original.to !== to || original.content !== content)) {
+  const original = existingId ? getMessages(teamId, undefined, team.workflow ? 'queue' : 'timeline').find(message => message.id === existingId) : undefined
+  if (original && (original.from !== sender || original.to !== to || original.content !== content ||
+      original.authenticatedAgent !== authenticatedAgent)) {
     return { error: 'Message id is already in use', status: 409 }
   }
   if (original?.delivery) {
     await pushing.get(key)
-    return { status: 200, data: { message: getMessages(teamId).find(message => message.id === id) ?? original } }
+    return { status: 200, data: { message: getTeamFeed(teamId).data?.messages.find(message => message.id === id) ?? original } }
   }
   const timestamp = new Date().toISOString()
   const recipients = (team.status === 'active' || (team.status === 'forming' && !!team.workflow)) &&
-    (!isWorkflowCommand(content) || (!!team.workflow && !content.startsWith(receiptPrefix)))
+    !isWorkflowCommand(content)
     ? team.agents.filter(agent => agent.status === 'active' && agent.name !== sender && (to === 'team' || to === agent.name))
     : []
   const message: EnsembleMessage = {
     id, teamId, from: sender, to, content, type: 'chat',
     timestamp: original?.timestamp || (team.workflow ? timestamp :
       (existingTimestamp && Number.isFinite(Date.parse(existingTimestamp)) ? existingTimestamp : timestamp)),
+    authenticatedAgent,
     priority: priority === 'urgent' ? 'urgent' : 'normal',
     delivery: recipients.map(agent => ({ recipient: agent.name, status: 'queued', at: timestamp, method: team.workflow ? 'pull' : 'pane' })),
   }
@@ -986,7 +1069,7 @@ export async function sendTeamMessage(
           }
           const file = collabDeliveryFile(teamId, session)
           fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
-          const temporary = `${file}.${uuidv4()}.tmp`
+          const temporary = `${file}.${randomUUID()}.tmp`
           try {
             fs.writeFileSync(temporary, input, { mode: 0o600 })
             const count = resolveAgentProgram(agent.program).pasteEnterCount
@@ -1140,6 +1223,17 @@ export function disbandTeam(teamId: string, failureReason?: string, finishStatus
   return finalization
 }
 
+async function sessionStopped(team: EnsembleTeam, agent: EnsembleTeam['agents'][number]): Promise<boolean> {
+  const session = agent.sessionName || `${team.name}-${agent.name}`
+  try {
+    if (agent.hostId && !isSelf(agent.hostId)) {
+      const host = getHostById(agent.hostId)
+      return !!host && await isRemoteSessionReady(host.url, session) === false
+    }
+    return !await getRuntime().sessionExists(session)
+  } catch { return false }
+}
+
 async function finalizeTeam(teamId: string, failureReason?: string, finishStatus?: 'ok' | 'failed' | 'stopped'): Promise<ServiceResult<{ team: EnsembleTeam }>> {
   const team = getTeam(teamId)
   if (!team) return { error: 'Team not found', status: 404 }
@@ -1149,8 +1243,9 @@ async function finalizeTeam(teamId: string, failureReason?: string, finishStatus
   acceptanceControllers.get(teamId)?.abort()
   updateTeam(teamId, { status: 'completed', failureReason })
 
-  // Write summary before killing sessions so the Claude Code session can present it
-  await writeDisbandSummary(teamId, failureReason ? { failureReason } : {})
+  const closing = !failureReason && finishStatus !== 'stopped' && finishStatus !== 'failed' && team.workflow &&
+    (team.workflow.state === 'CLOSING' || team.workflow.state === 'DONE')
+  if (!closing) await writeDisbandSummary(teamId, failureReason ? { failureReason } : {})
   if (team.pendingReplacement && await recoverPendingReplacement(teamId, team.pendingReplacement)) {
     updateTeam(teamId, { pendingReplacement: undefined })
   }
@@ -1167,9 +1262,9 @@ async function finalizeTeam(teamId: string, failureReason?: string, finishStatus
   )
 
   for (const agent of team.agents) {
-    if (agent.status === 'active' || (agent.status === 'failed' && agent.sessionName)) {
+    if (agent.status === 'active' || (agent.agentId && agent.sessionName && agent.status !== 'replaced')) {
       appendMessage(teamId, {
-        id: uuidv4(), teamId, from: 'ensemble', to: 'team',
+        id: randomUUID(), teamId, from: 'ensemble', to: 'team',
         content: `${agent.name} has left #${team.name}`,
         type: 'chat', timestamp: new Date().toISOString(),
       })
@@ -1178,6 +1273,26 @@ async function finalizeTeam(teamId: string, failureReason?: string, finishStatus
         await stopAgent(team, agent)
       } catch { /* session may already be gone */ }
     }
+  }
+
+  if (closing && team.workflow) {
+    const stopped = await Promise.all(team.agents.filter(agent => agent.agentId && agent.status !== 'replaced')
+      .map(agent => sessionStopped(team, agent)))
+    if (stopped.some(value => !value) || getTeam(teamId)?.pendingReplacement) {
+      failureReason = 'Could not confirm all agent sessions stopped before final acceptance'
+    } else if (!acceptanceStillCurrent(team, team.workflow)) {
+      failureReason = 'Git state changed after acceptance while agents were stopping'
+    }
+    if (failureReason) {
+      team.workflow.state = 'REVIEW'
+      if (team.workflow.acceptance) team.workflow.acceptance.passed = false
+      finishStatus = 'failed'
+    } else {
+      team.workflow.state = 'DONE'
+      finishStatus = 'ok'
+    }
+    updateTeam(teamId, { workflow: team.workflow, failureReason })
+    await writeDisbandSummary(teamId, { failureReason })
   }
 
   const agentsWithWorktrees = team.agents.filter(
@@ -1199,7 +1314,7 @@ async function finalizeTeam(teamId: string, failureReason?: string, finishStatus
       const result = await mergeWorktree(worktreeInfo, basePath)
 
       appendMessage(teamId, {
-        id: uuidv4(), teamId, from: 'ensemble', to: 'team',
+        id: randomUUID(), teamId, from: 'ensemble', to: 'team',
         content: result.success
           ? `🌳 Merged ${agent.name}'s worktree (${agent.worktreeBranch})`
           : `⚠️ Merge conflict for ${agent.name}: ${result.conflicts?.join(', ')}`,
@@ -1313,7 +1428,7 @@ async function finalizeTeam(teamId: string, failureReason?: string, finishStatus
           if (result.ok) return
           const content = memoryExportFailureMessage(result)
           appendMessage(teamId, {
-            id: uuidv4(), teamId, from: 'ensemble', to: 'team',
+            id: randomUUID(), teamId, from: 'ensemble', to: 'team',
             content,
             type: 'chat', timestamp: new Date().toISOString(),
           })

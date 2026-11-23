@@ -24,18 +24,24 @@ it.skipIf(!realTmux).each(shells)('launches through tmux with %s configured and 
   try {
     fs.writeFileSync(config, JSON.stringify({ agentEnv: { PROBE_SECRET: secret, CLAUDECODE: '1' } }))
     fs.writeFileSync(agents, JSON.stringify({ probe: { name: 'Probe', command: process.execPath, flags: [probe] } }))
-    fs.writeFileSync(probe, `const fs = require('fs'); fs.writeFileSync(${JSON.stringify(output)}, JSON.stringify({ secret: process.env.PROBE_SECRET, removed: !process.env.CLAUDECODE, tty: !!process.stdin.isTTY })); setInterval(() => { if (fs.existsSync(${JSON.stringify(exit)})) process.exit(3) }, 50)`)
+    fs.writeFileSync(probe, `const fs = require('fs'); fs.writeFileSync(${JSON.stringify(output)}, JSON.stringify({ secret: process.env.PROBE_SECRET, removed: !process.env.CLAUDECODE, token: process.env.ENSEMBLE_AGENT_TOKEN, tty: !!process.stdin.isTTY })); setInterval(() => { if (fs.existsSync(${JSON.stringify(exit)})) process.exit(3) }, 50)`)
     fs.writeFileSync(path.join(root, 'tmux'), `#!/bin/sh\nexec "${realTmux}" -S "${path.join(root, 'socket')}" -f /dev/null "$@"\n`, { mode: 0o755 })
     vi.stubEnv('PATH', `${root}:${process.env.PATH}`)
     vi.stubEnv('SHELL', has(shell))
     vi.stubEnv('ENSEMBLE_API_TOKEN', 'service-token-never-enters-tmux')
     vi.stubEnv('ENSEMBLE_CONFIG', config)
     vi.stubEnv('ENSEMBLE_AGENTS_CONFIG', agents)
-    const { sessionName } = await spawnLocalAgent({ name: 'environment-probe', program: 'probe', workingDirectory: root })
+    const agentToken = 'mock-scoped-agent-key'
+    const { sessionName } = await spawnLocalAgent({ name: 'environment-probe', program: 'probe', workingDirectory: root,
+      agentEnvironment: { ENSEMBLE_AGENT_TOKEN: agentToken },
+    })
     for (let attempt = 0; attempt < 60 && !fs.existsSync(output); attempt++) await new Promise(resolve => setTimeout(resolve, 50))
-    expect(JSON.parse(fs.readFileSync(output, 'utf8'))).toEqual({ secret, removed: true, tty: true })
+    expect(JSON.parse(fs.readFileSync(output, 'utf8'))).toEqual({ secret, removed: true, token: agentToken, tty: true })
     expect(tmux('show-environment', '-g')).not.toContain('service-token-never-enters-tmux')
     expect(tmux('capture-pane', '-p', '-t', sessionName)).not.toContain(secret)
+    expect(tmux('capture-pane', '-p', '-t', sessionName)).not.toContain(agentToken)
+    expect(tmux('show-environment', '-g')).not.toContain(agentToken)
+    expect(tmux('display-message', '-p', '-t', sessionName, '#{pane_start_command}')).not.toContain(agentToken)
     expect(tmux('display-message', '-p', '-t', sessionName, '#{pane_start_command}')).not.toContain(secret)
     fs.writeFileSync(exit, '')
     for (let attempt = 0; attempt < 60 && await getRuntime().sessionExists(sessionName); attempt++) await new Promise(resolve => setTimeout(resolve, 50))

@@ -23,7 +23,7 @@ export interface EnsembleTeam {
 export interface EnsembleTeamAgent {
   startedAt?: string
   sessionName?: string
-  startup?: 'session_created' | 'cli_ready' | 'prompt_delivered'
+  startup?: 'session_created' | 'cli_ready' | 'prompt_sending' | 'prompt_delivered'
   agentId: string
   name: string
   program: string
@@ -53,6 +53,8 @@ export interface EnsembleMessage {
   options?: string[]
   delivery?: Array<{ recipient: string; status: 'queued' | 'delivered' | 'failed'; at: string; method: 'pull' | 'pane'; reason?: string }>
   priority?: 'normal' | 'urgent'
+  /** Populated by the server after identifying an authenticated agent. */
+  authenticatedAgent?: string
 }
 
 export interface CreateTeamRequest {
@@ -70,6 +72,7 @@ export interface CreateTeamRequest {
   useWorktrees?: boolean
   staged?: boolean
   requireLeadReady?: boolean
+  requireRegression?: boolean
   stagedConfig?: StagedWorkflowConfig
 }
 
@@ -99,8 +102,9 @@ export interface CollabTemplatesFile {
 }
 
 export interface ManagedWorkflow {
-  state: 'STARTING' | 'WAITING_PLAN' | 'WORKING' | 'BLOCKED' | 'REVIEW' | 'ACCEPTED' | 'DONE'
+  state: 'STARTING' | 'WAITING_PLAN' | 'WORKING' | 'BLOCKED' | 'REVIEW' | 'ACCEPTED' | 'CLOSING' | 'DONE'
   requireLeadReady: boolean
+  requireRegression?: boolean
   lead: string
   startupDeadline: string
   plan?: string
@@ -112,6 +116,7 @@ export interface ManagedWorkflow {
   decisions: string[]
   approvedChanges: Array<{ paths: string[]; test: string; counterexample: string }>
   handled: string[]
+  pendingNotices?: Array<{ id: string; content: string }>
   acceptance?: { head: string; diff: string; digest: string; passed: boolean; artifact: string }
   report?: string
   staged?: boolean

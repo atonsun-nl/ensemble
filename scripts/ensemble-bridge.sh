@@ -134,6 +134,10 @@ try:
                 last_success = i + 1
                 continue
 
+            if msg.get('recordedViaApi'):
+                last_success = i + 1
+                continue
+
             content = msg.get('content','')
             if not content:
                 last_success = i + 1
@@ -168,7 +172,7 @@ try:
                     # error, permanent overslaan", waardoor een bericht bij een
                     # rate limit of een timeout definitief verdween in plaats van
                     # dat het opnieuw geprobeerd werd.
-                    if e.code in (401, 403, 408, 429):
+                    if e.code in (401, 408, 429):
                         delay = min(30.0, 0.5 * (2 ** attempt))
                         print(f'[bridge] {e.code} on line {i}, retry {attempt+1}/10 in {delay:.1f}s', file=sys.stderr, flush=True)
                         if attempt == 9:

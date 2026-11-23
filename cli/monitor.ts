@@ -9,8 +9,6 @@
  *   ensemble monitor                   # Interactive team picker
  */
 
-import http from 'http'
-import https from 'https'
 import readline from 'readline'
 import fs from 'fs'
 import { spawnSync } from 'child_process'
@@ -110,41 +108,22 @@ const authHeaders: Record<string, string> = process.env.ENSEMBLE_API_TOKEN
   ? { Authorization: `Bearer ${process.env.ENSEMBLE_API_TOKEN}` }
   : {}
 
-function apiGet<T>(path: string): Promise<T> {
-  return new Promise((resolve, reject) => {
-    const url = new URL(path, API_BASE)
-    const client = url.protocol === 'https:' ? https : http
-    client.get(url, { timeout: 5000, headers: authHeaders }, (res) => {
-      let data = ''
-      res.on('data', chunk => data += chunk)
-      res.on('end', () => {
-        try { resolve(JSON.parse(data)) }
-        catch (e) { reject(e) }
-      })
-    }).on('error', reject)
+async function requestJson<T>(path: string, options: RequestInit = {}): Promise<T> {
+  const response = await fetch(new URL(path, API_BASE), {
+    ...options, headers: { ...authHeaders, ...options.headers },
+    signal: AbortSignal.timeout(5000),
   })
+  if (!response.ok) throw new Error(`HTTP ${response.status} ${response.statusText}`.trim())
+  return response.json()
+}
+
+function apiGet<T>(path: string): Promise<T> {
+  return requestJson(path)
 }
 
 function apiPost<T>(path: string, body: unknown): Promise<T> {
-  return new Promise((resolve, reject) => {
-    const url = new URL(path, API_BASE)
-    const payload = JSON.stringify(body)
-    const client = url.protocol === 'https:' ? https : http
-    const req = client.request(url, {
-      method: 'POST',
-      headers: { ...authHeaders, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
-      timeout: 5000,
-    }, (res) => {
-      let data = ''
-      res.on('data', chunk => data += chunk)
-      res.on('end', () => {
-        try { resolve(JSON.parse(data)) }
-        catch (e) { reject(e) }
-      })
-    })
-    req.on('error', reject)
-    req.write(payload)
-    req.end()
+  return requestJson(path, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
   })
 }
 
@@ -177,6 +156,7 @@ class Monitor {
   private readonly MAX_MESSAGES = 1000
   private lastSeenTimestamp: string | null = null
   private scrollOffset = 0
+  private requestError = ''
   private inputMode = false
   private inputBuffer = ''
   private inputTarget = 'team'
@@ -405,6 +385,7 @@ class Monitor {
   }
 
   private async disbandTeam() {
+    this.requestError = ''
     try {
       // Fetch final messages BEFORE disbanding
       await this.fetchMessages()
@@ -429,7 +410,10 @@ class Monitor {
       // Exit cleanly — summary will appear in main session
       this.cleanup()
       process.exit(0)
-    } catch { /* ignore */ }
+    } catch (error) {
+      this.requestError = `Could not disband team · ${error instanceof Error ? error.message : 'request failed'}`
+      this.render()
+    }
   }
 
   private getLastAgentMessageTime(): number {
@@ -553,7 +537,7 @@ end tell`
     // ── Inline Summary (replaces messages area when active) ──
     const headerHeight = 4
     const completionMenuHeight = this.completionMenuActive ? 8 : 0
-    const footerHeight = this.inputMode ? 4 : 3
+    const footerHeight = (this.inputMode ? 4 : 3) + Number(!!this.requestError)
     const messageAreaHeight = h - headerHeight - footerHeight - completionMenuHeight
 
     if (this.showInlineSummary) {
@@ -707,6 +691,8 @@ end tell`
 
     // Separator
     lines.push(`${color.gray}${'─'.repeat(w)}${color.reset}\n`)
+
+    if (this.requestError) lines.push(`${color.brightRed} ${this.requestError.slice(0, Math.max(1, w - 2))}${color.reset}\n`)
 
     if (this.inputMode) {
       const targetStyle = getAgentStyle(this.inputTarget)

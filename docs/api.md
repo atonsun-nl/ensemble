@@ -15,8 +15,9 @@ for team mutations and reads from external peers. Configure
 the connecting peer to `X-Forwarded-For`. The server ignores that header from
 other peers. Use HTTPS at the reverse proxy for network access.
 
-Rate limit: 100 requests per 60 seconds per IP. Health and team detail/feed
-polling are exempt.
+Operator and unauthenticated requests are limited to 100 per IP per minute.
+Verified agent requests have a separate budget of 100 per agent, team and IP.
+Health and team detail/feed polling are exempt.
 
 ---
 
@@ -71,6 +72,7 @@ curl -X POST http://localhost:23000/api/ensemble/teams \
 - `templateName` (string) — use a collab template (`review`, `implement`, `debug`)
 - `staged` (boolean) — enable staged plan/execute/verify workflow
 - `stagedConfig` (object) — `planTimeoutMs`, `execTimeoutMs`, `verifyTimeoutMs`
+- `requireRegression` (boolean) — require a Git baseline and at least one configured regression check for acceptance.
 - `requireLeadReady` (boolean) — hold worker prompts until the Lead publishes a plan. Enabled by default for multi-agent teams.
 
 **Response:** `{ "team": EnsembleTeam }`
@@ -142,8 +144,12 @@ Stops all agents, generates summary, cleans up. Also available as `POST /api/ens
 
 A caller can supply a stable message `id` to retry a request. A reused ID with
 different sender, recipient or content returns `409`. For managed teams, a
-successful POST queues a message for the recipients to read. Each delivery
-records its state and timestamp. Set `priority: "urgent"` to label an urgent
+successful POST queues a message for the recipients to read. A managed agent
+credential permits posting as its holder and reading that holder's feed for the
+same team. Workflow events and delivery receipts require such a credential.
+Record a receipt by posting `<<COLLAB_RECEIVED>> ["message-id"]` to `ensemble`
+after processing the message. A read leaves the delivery queued until this
+acknowledgement. Each delivery records its state and timestamp. Set `priority: "urgent"` to label an urgent
 message in the inbox. It stays in FIFO order.
 
 ### `GET /api/ensemble/teams/:id/feed` — Message feed

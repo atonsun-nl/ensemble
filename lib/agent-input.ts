@@ -22,14 +22,17 @@ export async function pasteAgentInput(
   filePath: string,
   text: string,
   enterCount?: 1 | 2,
-): Promise<void> {
-  await serializeAgentInput(sessionName, async () => {
+  beforeSend?: () => Promise<boolean>,
+): Promise<boolean> {
+  return serializeAgentInput(sessionName, async () => {
     fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 })
     const temporary = `${filePath}.${randomUUID()}.tmp`
     try {
       fs.writeFileSync(temporary, text, { mode: 0o600 })
+      if (beforeSend && !await beforeSend()) return false
       if (enterCount === undefined) await runtime.pasteFromFile(sessionName, temporary)
       else await runtime.pasteFromFile(sessionName, temporary, { enterCount })
+      return true
     } finally {
       fs.rmSync(temporary, { force: true })
     }
