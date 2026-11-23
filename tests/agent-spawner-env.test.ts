@@ -1,52 +1,48 @@
 import fs from 'fs'
 import path from 'path'
-import { afterEach, describe, expect, it, vi } from 'vitest'
-
-const SRC = fs.readFileSync(path.resolve(process.cwd(), 'lib/agent-spawner.ts'), 'utf8')
-
-describe('env-forwarding', () => {
-  it('escapet de waarde', () => {
-    expect(SRC).not.toMatch(/export \$\{k\}="\$\{v\}"/)
-    expect(SRC).toMatch(/export \$\{k\}=\$\{shellEscape/)
-  })
-})
-
+import { execFileSync } from 'child_process'
+import { expect, it, vi } from 'vitest'
 import { spawnLocalAgent } from '../lib/agent-spawner'
+import { getRuntime } from '../lib/agent-runtime'
 
-let root: string | undefined
-afterEach(() => {
-  vi.unstubAllEnvs()
-  vi.restoreAllMocks()
-  if (root) fs.rmSync(root, { recursive: true, force: true })
-})
+const has = (binary: string) => {
+  try { return execFileSync('/bin/sh', ['-c', 'command -v "$1"', '_', binary], { encoding: 'utf8' }).trim() }
+  catch { return '' }
+}
+const realTmux = has('tmux')
+const shells = ['bash', 'zsh'].filter(has)
 
-it('delivers configured values to each agent even with a stale tmux server environment', async () => {
-  root = fs.mkdtempSync(path.resolve('tmp/spawner-env-'))
+it.skipIf(!realTmux).each(shells)('launches through tmux with %s configured and keeps credentials out of the pane', async shell => {
+  const root = fs.mkdtempSync('/tmp/ensemble-spawn-')
+  const tmux = (...args: string[]) => execFileSync(realTmux, ['-S', path.join(root, 'socket'), '-f', '/dev/null', ...args], { encoding: 'utf8' })
   const output = path.join(root, 'received.json')
+  const exit = path.join(root, 'exit')
   const probe = path.join(root, 'probe.cjs')
   const config = path.join(root, 'config.json')
   const agents = path.join(root, 'agents.json')
-  const tricky = "spaces ' quotes \" double $HOME $(false) `false`; literal"
-  fs.writeFileSync(config, JSON.stringify({ agentEnv: { MY_TOOL_NESTED: tricky, OPENAI_ENV_TEST: 'configured', EMPTY: '' } }))
-  fs.writeFileSync(agents, JSON.stringify({ probe: { name: 'Probe', command: process.execPath, flags: [probe] } }))
-  fs.writeFileSync(probe, `require('fs').writeFileSync(${JSON.stringify(output)}, JSON.stringify({ nested: process.env.MY_TOOL_NESTED, override: process.env.OPENAI_ENV_TEST, empty: process.env.EMPTY }))`)
-  // Only the sent pane command reaches this shell. The server environment is stale.
-  fs.writeFileSync(path.join(root, 'tmux'), `#!/bin/bash
-if [ "$1" = new-session ]; then exit 0; fi
-if [ "$1" = send-keys ] && [ "$4" = -l ]; then
-  exec /usr/bin/env -i PATH=/usr/bin:/bin MY_TOOL_NESTED=stale OPENAI_ENV_TEST=stale EMPTY=stale /bin/bash -c 'nocorrect() { "$@"; }; eval "$1"' fake-pane "$5"
-fi
-exit 1
-`, { mode: 0o755 })
-  vi.stubEnv('PATH', `${root}:${process.env.PATH}`)
-  vi.stubEnv('ENSEMBLE_CONFIG', config)
-  vi.stubEnv('ENSEMBLE_AGENTS_CONFIG', agents)
-  vi.stubEnv('OPENAI_ENV_TEST', 'parent')
-  const log = vi.spyOn(console, 'log').mockImplementation(() => {})
-  for (const name of ['env-agent-1', 'env-agent-2']) {
-    await spawnLocalAgent({ name, program: 'probe', workingDirectory: root, hostId: 'local' })
-    expect(JSON.parse(fs.readFileSync(output, 'utf8'))).toEqual({ nested: tricky, override: 'configured', empty: '' })
-    fs.unlinkSync(output)
+  const secret = "spaces ' quotes \" double $HOME $(false) `false`; literal"
+  try {
+    fs.writeFileSync(config, JSON.stringify({ agentEnv: { PROBE_SECRET: secret, CLAUDECODE: '1' } }))
+    fs.writeFileSync(agents, JSON.stringify({ probe: { name: 'Probe', command: process.execPath, flags: [probe] } }))
+    fs.writeFileSync(probe, `const fs = require('fs'); fs.writeFileSync(${JSON.stringify(output)}, JSON.stringify({ secret: process.env.PROBE_SECRET, removed: !process.env.CLAUDECODE, tty: !!process.stdin.isTTY })); setInterval(() => { if (fs.existsSync(${JSON.stringify(exit)})) process.exit(3) }, 50)`)
+    fs.writeFileSync(path.join(root, 'tmux'), `#!/bin/sh\nexec "${realTmux}" -S "${path.join(root, 'socket')}" -f /dev/null "$@"\n`, { mode: 0o755 })
+    vi.stubEnv('PATH', `${root}:${process.env.PATH}`)
+    vi.stubEnv('SHELL', has(shell))
+    vi.stubEnv('ENSEMBLE_API_TOKEN', 'service-token-never-enters-tmux')
+    vi.stubEnv('ENSEMBLE_CONFIG', config)
+    vi.stubEnv('ENSEMBLE_AGENTS_CONFIG', agents)
+    const { sessionName } = await spawnLocalAgent({ name: 'environment-probe', program: 'probe', workingDirectory: root })
+    for (let attempt = 0; attempt < 60 && !fs.existsSync(output); attempt++) await new Promise(resolve => setTimeout(resolve, 50))
+    expect(JSON.parse(fs.readFileSync(output, 'utf8'))).toEqual({ secret, removed: true, tty: true })
+    expect(tmux('show-environment', '-g')).not.toContain('service-token-never-enters-tmux')
+    expect(tmux('capture-pane', '-p', '-t', sessionName)).not.toContain(secret)
+    expect(tmux('display-message', '-p', '-t', sessionName, '#{pane_start_command}')).not.toContain(secret)
+    fs.writeFileSync(exit, '')
+    for (let attempt = 0; attempt < 60 && await getRuntime().sessionExists(sessionName); attempt++) await new Promise(resolve => setTimeout(resolve, 50))
+    await expect(getRuntime().sendKeys(sessionName, 'unexpected shell input', { literal: true, agentInput: true })).rejects.toThrow('no agent running')
+  } finally {
+    try { tmux('kill-server') } catch { /* The last session may have exited. */ }
+    vi.unstubAllEnvs()
+    fs.rmSync(root, { recursive: true, force: true })
   }
-  expect(JSON.stringify(log.mock.calls)).not.toContain(tricky)
 })

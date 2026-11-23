@@ -11,15 +11,16 @@ import {
   appendMessage, getMessages, markAgentFailed,
 } from '../lib/ensemble-registry'
 import {
-  spawnLocalAgent, killLocalAgent,
+  prepareLocalAgent, spawnLocalAgent, killLocalAgent,
   spawnRemoteAgent as spawnRemote, killRemoteAgent,
   postRemoteSessionCommand, isRemoteSessionReady,
   getAgentTokenUsage,
 } from '../lib/agent-spawner'
 import { isSelf, getHostById, getSelfHostId } from '../lib/hosts-config'
 import { getRuntime } from '../lib/agent-runtime'
+import { pasteAgentInput, serializeAgentInput } from '../lib/agent-input'
 import { detectLiveGate, isShellCommand } from '../lib/startup-gates'
-import { resolveAgentProgram, resolveAgentProgramDetailed, availableAgentKeys } from '../lib/agent-config'
+import { resolveAgentProgram, resolveAgentProgramDetailed, availableAgentKeys, shellEscape } from '../lib/agent-config'
 import { exportObservation, checkMemoryEndpoint, type MemoryExportResult } from '../lib/memory-export'
 import { AgentWatchdog } from '../lib/agent-watchdog'
 import {
@@ -30,12 +31,12 @@ import {
 import fs from 'fs'
 import path from 'path'
 import { fileURLToPath } from 'url'
-import { spawn, execFileSync } from 'child_process'
+import { execFileSync } from 'child_process'
 import { createTeamWorktree, createWorktree, mergeWorktree, destroyWorktree, type WorktreeInfo } from '../lib/worktree-manager'
-import { runStagedWorkflow } from '../lib/staged-workflow'
+import { applyWorkflowCommand, isWorkflowCommand, readBaseline, receiptPrefix } from '../lib/managed-workflow'
 import { readEnsembleConfig } from '../lib/ensemble-config'
 import { emitEvent, runPlan, type BrainEvent } from '../lib/brain-hooks'
-import { replaceTeamAgent, stopTeamReplacements } from '../lib/agent-replacement'
+import { replaceTeamAgent, recoverPendingReplacement, stopTeamReplacements } from '../lib/agent-replacement'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
@@ -49,83 +50,10 @@ const IDLE_CHECK_INTERVAL_MS = 15_000
 // How long a freshly typed start command may leave the shell in the foreground
 // before the agent counts as not started (a wrapper script execs quickly).
 const AGENT_START_GRACE_MS = 5_000
-const COMPLETION_SIGNAL_WINDOW_MS = 180_000
-// How long a team must be silent before completion WORDING may end it.
-//
-// These were 120s and 60s, and that killed a four-agent research team after
-// 4,5 minutes on 2026-08-15. Two agents had written "eerste lezing klaar; nu
-// tests" and "systematische vergelijking klaar" about sub-steps, after which
-// everyone went quiet to actually read code. Sixty seconds of silence is not an
-// idle team, it is an agent reading a file. Research runs routinely go minutes
-// without posting, so the wording path needs a margin that only a genuinely
-// finished team reaches. The exact sentinel remains the fast path and is
-// unaffected: a team that is really done still ends within seconds.
-const SINGLE_SIGNAL_IDLE_THRESHOLD_MS = 480_000
-const TWO_SIGNAL_IDLE_THRESHOLD_MS = 300_000
-const MIN_MESSAGES_BEFORE_AUTO_DISBAND = 10
-// Explicit sentinel: when every active agent sends this exact marker as a full
-// message, the team auto-disbands immediately — no idle wait, no minimum
-// message count. Agents are instructed to use it in buildPromptPreview.
 const EXPLICIT_DONE_SENTINEL = '<<COLLAB_DONE>>'
-const COMPLETION_PATTERNS = [
-  /(?:^|[^\p{L}\p{N}_])afgerond(?:[^\p{L}\p{N}_]|$)/iu,
-  /(?:^|[^\p{L}\p{N}_])\bdone\b(?![.\w])/iu,
-  // "completed" but not ".completed" (method/property access) or "completion"
-  // De punt hoort in de boundary-groep zelf, anders kijkt de lookbehind naar het
-  // teken vóór de punt en doet de uitzondering niets.
-  /(?:^|[^\p{L}\p{N}_.])completed(?:[^\p{L}\p{N}_]|$)/iu,
-  // "klaar" but not "klaar sta", "klaar ben", "klaar om", "klaar voor"
-  /(?:^|[^\p{L}\p{N}_])klaar(?!\s+(?:sta|ben|om|voor|zodra))(?:[^\p{L}\p{N}_]|$)/iu,
-  /(?:^|\s)tot de volgende(?:\s|$)/i,
-]
+const lifecycleWork = new Map<string, Promise<ServiceResult<{ team: EnsembleTeam }>>>()
+const acceptanceControllers = new Map<string, AbortController>()
 
-// Phrases that mean "this part is done, I am carrying on". A message carrying one
-// of these is a progress report, not a closing statement, however much finished
-// wording it contains.
-const CONTINUATION_PATTERNS = [
-  /\bnu\s+(?:ga|pak|lees|start|check|onderzoek|kijk|volgt|de\b)/i,
-  /\b(?:ik|we)\s+(?:ga|gaan)\s+(?:nu\s+)?(?:verder|door|kijken|lezen|onderzoeken)/i,
-  /\bvervolgens\b|\bdaarna\b|\bhierna\b/i,
-  /\beerste\s+(?:lezing|ronde|indruk|scan|bevinding)/i,
-  /\bdeel(?:taak|resultaat|bevinding)\b|\btussenstand\b|\bprogress\b/i,
-  /\bwacht\s+(?:op|nog)\b|\bmeer\s+volgt\b|\bkom\s+ik\s+op\s+terug\b/i,
-  // Explicitly claiming a slice of the work is the opposite of finishing it
-  /\bik\s+pak\b|\bik\s+claim\b|\bmijn\s+(?:hoek|kavel|deel)\b/i,
-  // "<werkproduct> klaar" reports a deliverable, "ik ben klaar" reports a person.
-  // Only the second one ends a session. This is the distinction that "systematische
-  // vergelijking klaar" fell foul of: a finished comparison is not a finished agent.
-  /\b(?:vergelijking|analyse|lezing|ronde|scan|check|onderzoek|inventarisatie|review|bevindingen|tabel|overzicht)\s+(?:is\s+)?(?:klaar|done|afgerond)\b/i,
-]
-
-// Unmistakable closing statements. These outrank the continuation filter: an
-// agent that says it has nothing left to add is finished, even if the same
-// sentence mentions a deliverable that is "afgerond".
-const CLOSING_PATTERNS = [
-  /\bniets?\s+(?:meer\s+)?(?:toe\s+te\s+voegen|te\s+melden|op(?:en)?staand)/i,
-  /\bgeen\s+(?:openstaande|resterende)\s+punten\b/i,
-  /\b(?:ik\s+ben|we\s+zijn)\s+klaar\b/i,
-  /\bik\s+sluit\s+(?:af|hierbij)\b|\bakkoord\s+met\s+(?:sluiten|closure)\b/i,
-]
-
-// Interactive gates that block agent startup and need an automated response.
-// Debounced: same gate is not re-sent within 3 seconds to avoid key-repeat storms.
-interface CompletionSignal {
-  agentName: string
-  timestamp: number
-}
-
-/**
- * Does this message mean the agent is done, or only that a step is done?
- *
- * Order matters. An explicit closing statement wins outright. Otherwise a
- * message that reports progress or a delivered work product is not an ending,
- * however much finishing vocabulary it contains. Only what is left counts.
- */
-function isCompletionStatement(content: string): boolean {
-  if (CLOSING_PATTERNS.some(pattern => pattern.test(content))) return true
-  if (!COMPLETION_PATTERNS.some(pattern => pattern.test(content))) return false
-  return !CONTINUATION_PATTERNS.some(pattern => pattern.test(content))
-}
 // Telegram notifications: set both env vars to enable, omit to disable
 const TELEGRAM_BOT_TOKEN = process.env.ENSEMBLE_TELEGRAM_BOT_TOKEN || ''
 const TELEGRAM_CHAT_ID = process.env.ENSEMBLE_TELEGRAM_CHAT_ID || ''
@@ -135,13 +63,12 @@ const ALERT_HUB_SECRET = process.env.ALERT_HUB_SECRET || ''
 
 class EnsembleService {
   private readonly disbandingTeams = new Set<string>()
-  private readonly doneEvents = new Map<string, string>()
+  private readonly doneEvents = new Set<string>()
   private readonly deadlineWarnings = new Map<string, number>()
   private readonly idleCheckTimer: NodeJS.Timeout
   private readonly watchdog: AgentWatchdog
 
   constructor() {
-    this.cleanupStaleTeams()
     this.idleCheckTimer = setInterval(() => {
       void this.checkIdleTeams()
     }, IDLE_CHECK_INTERVAL_MS)
@@ -169,6 +96,7 @@ class EnsembleService {
       postRemoteSessionCommand,
       collabDeliveryFile,
       onTeamUnreachable: (teamId, reason) => this.endUnreachableTeam(teamId, reason),
+      passive: true,
     })
 
     // Warn early about connectivity, but generic CORS OPTIONS responses cannot
@@ -212,7 +140,6 @@ class EnsembleService {
         type: 'chat',
         timestamp: new Date().toISOString(),
       })
-      await writeDisbandSummary(teamId, { failureReason: reason })
       await disbandTeam(teamId, reason)
     } catch (err) {
       console.error(`[Ensemble] Failed to end unreachable team ${teamId}:`, err)
@@ -221,64 +148,8 @@ class EnsembleService {
     }
   }
 
-  private cleanupStaleTeams(): void {
-    const teams = loadTeams()
-    const staleThresholdMs = 2 * 60 * 60 * 1000 // 2 hours
-    const now = Date.now()
-    let count = 0
-    for (const team of teams) {
-      if (team.status !== 'active') continue
-      const age = now - new Date(team.createdAt).getTime()
-      if (age > staleThresholdMs) {
-        // Write a summary first: these teams did real work whose outcome would
-        // otherwise be lost, which is exactly what happened to 7 teams before.
-        const reason = `stale on service start, still active after ${formatDuration(age)}`
-        void writeDisbandSummary(team.id, { failureReason: reason }).catch(err =>
-          console.error(`[Ensemble] Stale summary failed for ${team.id}:`, err),
-        )
-        // Een team dat op disbanded gaat zonder dat zijn processen stoppen, wordt
-        // daarna door de watchdog en checkIdleTeams overgeslagen omdat die op
-        // status 'active' filteren. De tmux-sessies en de poller blijven dan voor
-        // altijd draaien.
-        this.stopTeamProcesses(team.id)
-        updateTeam(team.id, { ...team, status: 'disbanded' })
-        count++
-      }
-    }
-    if (count > 0) {
-      console.log(`[Ensemble] Startup cleanup: disbanded ${count} stale active team(s)`)
-    }
-  }
-
-  // Killt de tmux-sessies uit het sessieregister en stopt bridge/poller via de
-  // gedeelde bash-functie stop_team_processes (scripts/collab-paths.sh). Puur
-  // best-effort: een ontbrekend register of een proces dat al weg is, is geen
-  // fout, dat gebeurt precies bij de oudere teams die dit moet opruimen.
-  private stopTeamProcesses(teamId: string): void {
-    try {
-      const sessions = fs.readFileSync(collabSessionsFile(teamId), 'utf8')
-        .split('\n')
-        .map(line => line.trim())
-        .filter(Boolean)
-      for (const session of sessions) {
-        try {
-          execFileSync('tmux', ['kill-session', '-t', session], { stdio: 'ignore' })
-        } catch { /* sessie bestond al niet meer */ }
-      }
-    } catch { /* geen sessieregister, bijvoorbeeld een ouder team */ }
-
-    try {
-      const pathsScript = path.join(__dirname, '../scripts/collab-paths.sh')
-      execFileSync(
-        'bash',
-        ['-c', '. "$1" && stop_team_processes "$2"', '_', pathsScript, collabRuntimeDir(teamId)],
-        { stdio: 'ignore' },
-      )
-    } catch { /* geen bridge/poller meer te stoppen */ }
-  }
-
   async checkIdleTeams(): Promise<void> {
-    const teams = loadTeams().filter(team => team.status === 'active')
+    const teams = loadTeams().filter(team => team.status === 'active' || team.status === 'forming' || team.status === 'completed')
 
     const activeIds = new Set(teams.map(team => team.id))
     for (const id of this.deadlineWarnings.keys()) {
@@ -286,24 +157,47 @@ class EnsembleService {
     }
     const config = readEnsembleConfig()
     for (const team of teams) {
-      if (this.disbandingTeams.has(team.id)) continue
+      if (this.disbandingTeams.has(team.id) || startingTeams.has(team.id) || lifecycleWork.has(team.id)) continue
+      this.disbandingTeams.add(team.id)
       try {
-        for (const agent of team.agents.filter(a => a.status === 'active')) {
-          const last = [...getMessages(team.id)].reverse().find(m => m.from === agent.name)
-          const key = `${team.id}:${agent.name}`
-          if (last?.content.trim() === EXPLICIT_DONE_SENTINEL && this.doneEvents.get(key) !== last.id) {
-            this.doneEvents.set(key, last.id)
-            teamEvent(team, 'agent_done', { agent: agent.name })
+        if (team.status === 'completed') {
+          await disbandTeam(team.id, team.failureReason, team.workflow?.state === 'DONE' ? 'ok' : undefined)
+          continue
+        }
+        if (team.status === 'forming') {
+          await disbandTeam(team.id, 'Service restarted during startup')
+          continue
+        }
+        if (team.workflow) {
+          await processManagedTeam(team)
+          if (getTeam(team.id)?.status !== 'active') continue
+          if (team.workflow.state === 'DONE') {
+            await disbandTeam(team.id, undefined, 'ok')
+            continue
+          }
+          if (team.workflow.phaseDeadline && Date.now() >= Date.parse(team.workflow.phaseDeadline)) {
+            await disbandTeam(team.id, `Staged deadline expired in ${team.workflow.state}`)
+            continue
+          }
+          if (team.workflow.state === 'WAITING_PLAN' && Date.now() >= Date.parse(team.workflow.startupDeadline)) {
+            await disbandTeam(team.id, 'Lead did not acknowledge a plan before the startup deadline')
+            continue
           }
         }
-        if (config.maxTeamMinutes !== undefined) {
+        if (config.maxTeamMinutes !== undefined || config.maxIdleMinutes !== undefined) {
           const ageMs = Date.now() - new Date(team.createdAt).getTime()
-          const deadlineMs = config.maxTeamMinutes * 60_000
+          const messages = getMessages(team.id)
+          const lastActivity = messages.reduce((latest, message) =>
+            message.from === 'ensemble' ? latest : Math.max(latest, Date.parse(message.timestamp) || 0),
+          Date.parse(team.createdAt))
+          const timeLimit = config.maxTeamMinutes !== undefined && ageMs >= config.maxTeamMinutes * 60_000
+          const idleLimit = config.maxIdleMinutes !== undefined && Date.now() - lastActivity >= config.maxIdleMinutes * 60_000
           const graceMs = config.graceMinutes * 60_000
-          if (ageMs >= deadlineMs) {
+          if (timeLimit || idleLimit || this.deadlineWarnings.has(team.id) ||
+              messages.some(message => message.from === 'ensemble' && message.content.startsWith('Time is up:'))) {
             let warningAt = this.deadlineWarnings.get(team.id)
             if (warningAt === undefined) {
-              const persistedWarning = getMessages(team.id).find(message =>
+              const persistedWarning = messages.find(message =>
                 message.from === 'ensemble' && message.content.startsWith('Time is up:') &&
                 Number.isFinite(Date.parse(message.timestamp)),
               )
@@ -315,9 +209,7 @@ class EnsembleService {
             if (warningAt === undefined) {
               warningAt = Date.now()
               this.deadlineWarnings.set(team.id, warningAt)
-              await sendTeamMessage(team.id, 'team',
-                `Time is up: send your final conclusion and then an exact <<COLLAB_DONE>> message within ${config.graceMinutes} minutes.`,
-                'ensemble')
+              recordSystemMessage(team.id, `Time is up: submit your final report within ${config.graceMinutes} minutes. Limit: ${timeLimit ? 'runtime' : 'inactivity'}.`)
             }
             if (Date.now() >= warningAt + graceMs) {
               this.disbandingTeams.add(team.id)
@@ -325,7 +217,7 @@ class EnsembleService {
                 const reason = `team stopped on time limit after ${formatDuration(ageMs)}`
                 appendMessage(team.id, {
                   id: uuidv4(), teamId: team.id, from: 'ensemble', to: 'team',
-                  content: `Team ended after maximum runtime (${config.maxTeamMinutes} minutes) and grace period`,
+                  content: 'Team ended after its configured deadline and grace period',
                   type: 'chat', timestamp: new Date().toISOString(),
                 })
                 await disbandTeam(team.id, reason)
@@ -339,119 +231,36 @@ class EnsembleService {
             }
           }
         }
-        if (!this.shouldAutoDisband(team)) continue
-
-        this.disbandingTeams.add(team.id)
-
-        try {
-          appendMessage(team.id, {
-            id: uuidv4(),
-            teamId: team.id,
-            from: 'ensemble',
-            to: 'team',
-            content: 'Auto-disband triggered after 60s idle and completion-like agent messages',
-            type: 'chat',
-            timestamp: new Date().toISOString(),
-          })
-
-          await writeDisbandSummary(team.id)
-          await disbandTeam(team.id, undefined, 'ok')
-        } catch (err) {
-          console.error(`[Ensemble] Auto-disband failed for ${team.id}:`, err)
-        } finally {
-          this.disbandingTeams.delete(team.id)
-          this.deadlineWarnings.delete(team.id)
+        if (!team.workflow) {
+          const completed = new Set(getMessages(team.id).filter(message => message.content.trim() === EXPLICIT_DONE_SENTINEL).map(message => message.from))
+          for (const agent of team.agents.filter(agent => completed.has(agent.name) && agent.status === 'active')) {
+            const key = `${team.id}:${agent.name}`
+            if (this.doneEvents.has(key)) continue
+            this.doneEvents.add(key)
+            teamEvent(team, 'agent_done', { agent: agent.name })
+          }
         }
-      } catch (err) {
-        console.error(`[Ensemble] Idle check failed for ${team.id}:`, err)
+        // Existing teams use the exact sentinel once per original active agent.
+        // A late status or a duplicate sentinel cannot reopen a completed turn.
+        if (!team.workflow && this.shouldAutoDisband(team)) {
+          recordSystemMessage(team.id, 'Auto-disband triggered after all remaining agents sent the completion marker')
+          await disbandTeam(team.id, undefined, 'ok')
+        }
+      } catch (error) {
+        console.error(`[Ensemble] Lifecycle check failed for ${team.id}:`, error)
+      } finally {
+        this.disbandingTeams.delete(team.id)
       }
     }
   }
 
   private shouldAutoDisband(team: EnsembleTeam): boolean {
-    const messages = getMessages(team.id)
-    const activeNames = new Set(team.agents.filter(a => a.status === 'active').map(a => a.name))
-    const knownNames = new Set(team.agents.map(a => a.name))
-    const nonEnsembleMessages = messages.filter(message =>
-      message.from !== 'ensemble' && (!knownNames.has(message.from) || activeNames.has(message.from)),
-    )
-    const lastMessage = nonEnsembleMessages[nonEnsembleMessages.length - 1]
-    if (!lastMessage) return false
-
-    // Every active agent must finish after the latest content from other agents.
-    // Another sentinel is only a completion marker, so it does not reopen work.
-    const contentMessages = messages.filter(m => activeNames.has(m.from) && m.content.trim() !== EXPLICIT_DONE_SENTINEL)
-    const sentinelSenders = new Set(
-      messages
-        .filter(m => activeNames.has(m.from) && m.content.trim() === EXPLICIT_DONE_SENTINEL)
-        .filter(m => {
-          const sentAt = Date.parse(m.timestamp)
-          return Number.isFinite(sentAt) && contentMessages.every(other =>
-            other.from === m.from || sentAt > Date.parse(other.timestamp),
-          )
-        })
-        .map(m => m.from),
-    )
-    if (activeNames.size > 0 && sentinelSenders.size >= activeNames.size) return true
-
-    // Last own sentinels also close a quiet team when status chatter invalidated
-    // the immediate completion path. System messages do not reset agent idle time.
-    const latestAgentMessages = [...activeNames].map(name =>
-      [...messages].reverse().find(message => message.from === name),
-    )
-    if (latestAgentMessages.length > 0 && latestAgentMessages.every(message =>
-      message?.content.trim() === EXPLICIT_DONE_SENTINEL && Number.isFinite(Date.parse(message.timestamp)),
-    )) {
-      const lastAgentTimestamp = Math.max(...latestAgentMessages.map(message => Date.parse(message!.timestamp)))
-      if (Date.now() - lastAgentTimestamp > TWO_SIGNAL_IDLE_THRESHOLD_MS) return true
-    }
-
-    // Don't auto-disband until agents have exchanged enough messages
-    if (nonEnsembleMessages.length < MIN_MESSAGES_BEFORE_AUTO_DISBAND) return false
-
-    // Robust timestamp handling: skip idle check if no timestamp available
-    const lastTimestamp = lastMessage.timestamp
-      ? new Date(lastMessage.timestamp).getTime()
-      : NaN
-    if (Number.isNaN(lastTimestamp)) return false
-
-    const activeAgents = team.agents.filter(agent => agent.status === 'active')
-    if (activeAgents.length === 0) return false
-
-    const idleForMs = Date.now() - lastTimestamp
-    const activeAgentNames = new Set(activeAgents.map(agent => agent.name))
-    const completionSignals = messages
-      .filter(message => activeAgentNames.has(message.from) && this.hasCompletionSignal(message.content))
-      .map(message => ({
-        agentName: message.from,
-        timestamp: message.timestamp ? new Date(message.timestamp).getTime() : NaN,
-      }))
-      .filter((signal): signal is CompletionSignal => !Number.isNaN(signal.timestamp))
-      .sort((a, b) => a.timestamp - b.timestamp)
-
-    // Wording alone never ends a live session. Agents say "klaar" about a
-    // sub-step, and even a tentative closure proposal ("I think
-    // we're done because X") is itself a match. Killing on that costs a trio its
-    // third agent mid-task. The exact sentinel above is the fast path; these
-    // patterns are only a safety net for teams that go quiet without sending it.
-    if (idleForMs <= TWO_SIGNAL_IDLE_THRESHOLD_MS) return false
-    if (this.hasTwoRecentCompletionSignals(completionSignals)) return true
-    if (idleForMs <= SINGLE_SIGNAL_IDLE_THRESHOLD_MS) return false
-    return completionSignals.length >= 1
-  }
-
-  private hasCompletionSignal(content: string): boolean {
-    return isCompletionStatement(content)
-  }
-
-  private hasTwoRecentCompletionSignals(signals: CompletionSignal[]): boolean {
-    for (let i = 0; i < signals.length; i++) {
-      for (let j = i + 1; j < signals.length; j++) {
-        if (signals[j].timestamp - signals[i].timestamp > COMPLETION_SIGNAL_WINDOW_MS) break
-        if (signals[i].agentName !== signals[j].agentName) return true
-      }
-    }
-    return false
+    const expected = team.agents.filter(agent => agent.status !== 'replaced' && agent.status !== 'failed')
+    const finished = new Set(getMessages(team.id)
+      .filter(message => message.content.trim() === EXPLICIT_DONE_SENTINEL)
+      .map(message => message.from))
+    return expected.length > 0 && expected.every(agent =>
+      (agent.status === 'active' || agent.status === 'done') && finished.has(agent.name))
   }
 
   private stop(): void {
@@ -542,7 +351,7 @@ function postToAlertHub(url: string, secret: string, payload: string): void {
       }
     })
     .catch(err => {
-      console.error('[Ensemble] Failed to post to alert-hub:', err)
+      console.error('[Ensemble] Failed to post to alert-hub:', err instanceof Error ? err.name : 'network error')
     })
 }
 
@@ -590,26 +399,14 @@ function sendTelegramSummary(params: {
     agentLine,
   ].join('\n')
 
-  const curl = spawn(
-    'curl',
-    [
-      '-sS',
-      '-X', 'POST',
-      `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
-      '-d', `chat_id=${TELEGRAM_CHAT_ID}`,
-      '-d', `parse_mode=MarkdownV2`,
-      '--data-urlencode', `text=${text}`,
-    ],
-    {
-      detached: true,
-      stdio: 'ignore',
-    },
-  )
-
-  curl.on('error', err => {
-    console.error('[Ensemble] Failed to start Telegram notification:', err)
-  })
-  curl.unref()
+  void fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, parse_mode: 'MarkdownV2', text }),
+    signal: AbortSignal.timeout(5000),
+  }).then(result => {
+    if (!result.ok) console.error(`[Ensemble] Telegram notification failed: HTTP ${result.status}`)
+  }).catch(() => console.error('[Ensemble] Telegram notification failed'))
 }
 
 async function routeToHost(_program: string, preferredHostId?: string): Promise<string> {
@@ -648,93 +445,40 @@ export function buildPromptPreview(params: {
   teammateNames: string[]
   agentIndex: number
   templateName?: string
+  role?: string
+  staged?: boolean
 }): string {
   const taskPreamble = readEnsembleConfig().taskPreamble
   const template = loadCollabTemplate(params.templateName)
   const scriptsDir = path.join(__dirname, '..', 'scripts')
-  // Everyone reads the same feed regardless of the `to` field, so with more than
-  // one teammate address the team — naming a single one reads as a private aside.
-  const sayTarget = params.teammateNames.length === 1 ? params.teammateNames[0] : 'team'
-  const teamSayCmd = `${scriptsDir}/team-say.sh ${params.teamId} ${params.agentName} ${sayTarget || 'team'}`
-  const teamReadCmd = `${scriptsDir}/team-read.sh ${params.teamId}`
-
-  if (params.teammateNames.length === 0) {
-    return [
-      `You are ${params.agentName}, the only agent in team "${params.teamName}".`,
-      ...(taskPreamble ? [`Task preamble: ${taskPreamble}`] : []),
-      `Task: ${params.description}`,
-      `You own the entire task: planning, implementation or analysis, verification, and reporting.`,
-      `COMMUNICATION RULES:`,
-      `Send your plan, progress, findings, and blockers via: ${teamSayCmd} "your message"`,
-      `After EVERY analysis or implementation step, run team-say to record what you found or changed.`,
-      `Read the feed for user instructions: ${teamReadCmd}`,
-      `DONE PROTOCOL:`,
-      `Complete and verify the task, then report your results, conclusions, and any remaining limitations via team-say.`,
-      `Only after that, send a FINAL team-say whose message is EXACTLY <<COLLAB_DONE>> (nothing else). This ends the team and preserves the summary.`,
-      `Start NOW: share your plan with team-say, then carry out the task independently.`,
-    ].join(' ')
-  }
-
-  // Scale teammate wording to the number of agents in the team.
-  const mateCount = params.teammateNames.length
-  const solo = mateCount === 1
-  const mateWord = solo ? 'teammate' : 'teammates'
-  const mateList = solo
-    ? params.teammateNames[0]
-    : params.teammateNames.slice(0, -1).join(', ') + ' and ' + params.teammateNames[mateCount - 1]
-  const agentTotal = mateCount + 1
-
-  let roleInstructions: string[]
-
-  if (template && params.agentIndex < template.roles.length) {
-    const templateRole = template.roles[params.agentIndex]
-    roleInstructions = [
-      `ROLE: ${templateRole.role}.`,
-      templateRole.focus,
-    ]
-  } else {
-    const isLead = params.agentIndex === 0
-    const roleName = isLead ? 'LEAD' : 'WORKER'
-    roleInstructions = isLead
-      ? [
-          `ROLE: ${roleName}.`,
-          `You own architecture, planning, high-level design, task breakdown, and code review.`,
-          `Your first action after greeting is to share a concrete implementation plan with the ${solo ? 'worker' : 'workers'} before any implementation starts.`,
-          solo
-            ? `Keep the worker focused by delegating clear implementation steps, reviewing progress, and calling out risks or design corrections early.`
-            : `Keep the workers focused by giving each of them a clearly separated piece of the work, reviewing progress, and calling out risks, overlap, or design corrections early.`,
-        ]
-      : [
-          `ROLE: ${roleName}.`,
-          `You own implementation, writing code, running tests, and reporting concrete execution progress.`,
-          `After greeting, wait for the lead's plan before starting implementation work.`,
-          ...(solo ? [] : [`You are not the only worker: before you start on a piece, check the feed for what the others already claimed, and say what you are taking so nobody duplicates it.`]),
-          `Once the lead shares a plan, execute it pragmatically, report what you changed, and surface blockers or test failures quickly.`,
-        ]
-  }
-
+  const say = `${shellEscape(path.join(scriptsDir, 'team-say.sh'))} ${shellEscape(params.teamId)} ${shellEscape(params.agentName)} team`
+  const read = `${shellEscape(path.join(scriptsDir, 'team-read.sh'))} ${shellEscape(params.teamId)} ${shellEscape(params.agentName)}`
+  const lead = (params.role ?? (params.agentIndex === 0 ? 'lead' : 'worker')).toLowerCase() === 'lead' || !params.teammateNames.length
   return [
-    `You are ${params.agentName} in team "${params.teamName}" with ${mateWord} ${mateList}.`,
+    `You are ${params.agentName}, ${lead ? 'Lead' : 'worker'} of "${params.teamName}".`,
+    ...(params.teammateNames.length ? [`Teammates: ${params.teammateNames.join(', ')}.`] : []),
     ...(taskPreamble ? [`Task preamble: ${taskPreamble}`] : []),
     `Task: ${params.description}`,
-    ...roleInstructions,
-    `COMMUNICATION RULES:`,
-    `1. Send findings: ${teamSayCmd} "your message"`,
-    `2. Read teammate messages: ${teamReadCmd}`,
-    `3. After EVERY analysis step, run team-say to share what you found`,
-    `4. After EVERY team-say, run team-read to check for responses`,
-    `5. If teammate shared findings, RESPOND to them`,
-    `6. Keep alternating: analyze, share, read, respond, analyze`,
-    `DONE PROTOCOL (important):`,
-    `7. When your work is complete and there is no unanswered teammate content or question after your last message, report the conclusion and send a FINAL team-say whose message is EXACTLY the sentinel <<COLLAB_DONE>> (nothing else, no quotes, no prose). Do not send status messages without new information, do not wait for an approval that may never come, and do not leave open questions addressed to you unresolved.`,
-    `8. The team auto-disbands only after all ${agentTotal} agents have sent <<COLLAB_DONE>>. If new teammate content arrives after your sentinel, respond substantively and send the sentinel again once your work is complete and all questions addressed to you are resolved.`,
-    `9. Before sending <<COLLAB_DONE>>, make sure the important conclusions (recommendation, rationale, build list, layout, decisions) are actually present as long team-say messages in the transcript — that is what the summary will preserve. Do not keep insights only in your head.`,
-    `Start NOW: greet your teammate with team-say, then begin.`,
-  ].join(' ')
+    template?.roles[params.agentIndex]?.focus || '',
+    params.staged ? 'Staged workflow: plan, implement, then review the diff and run the acceptance checks.' : '',
+    `Share decisions, actionable findings and blockers with ${say} "message". Read new messages with ${read} at task boundaries, and use --all to review the history. Messages do not request an acknowledgement by default.`,
+    'Send a workflow event with team-say and one quoted argument of the form <<COLLAB_EVENT>> followed by a JSON object.',
+    lead
+      ? [
+          'Publish the implementation plan before editing: {"action":"plan","plan":"..."}',
+          'After the service acknowledges it, assign each task and its paths: {"action":"assign","task":"...","owner":"agent-name","paths":["path/to/file"]}. Specify takeover:true and reason when transferring a conflicting claim.',
+          'Approve critical changes with {"action":"change","paths":["..."],"test":"...","counterexample":"..."}. Record decisions with {"action":"decision","decision":"..."}.',
+          'Review the Git diff and submissions. Submit Lead work with {"action":"submit","report":"..."}, request machine acceptance with {"action":"accept"}, and wait for its result. After acceptance passes, file the final report once with {"action":"close","report":"..."}.',
+        ].join(' ')
+      : 'Read the acknowledged Lead plan and wait for an assignment naming you before editing. Edit only paths assigned to you. When ready for Lead review, send {"action":"submit","report":"Changes, tests and remaining risks"}.',
+    `While awaiting a plan acknowledgement, assignment, or review result, keep your turn active and use ${read} --wait. Repeat until the requested workflow event arrives. Workers stay available for review feedback until acceptance. The Lead can end its turn after filing the final report.`,
+    'Use {"action":"block","reason":"..."} to raise a blocker and {"action":"unblock"} when it is resolved. Commits require explicit operator policy.',
+    'Optionally record a long tool call with {"action":"activity","state":"busy","tool":"tool name"} and send state "idle" at its next safe boundary.',
+  ].filter(Boolean).join('\n')
 }
 
 async function waitForReady(
-  sessionName: string, program: string, hostId?: string, maxWait = 60000,
+  sessionName: string, program: string, hostId?: string, maxWait = 60000, strictRemote = true,
 ): Promise<boolean> {
   const runtime = getRuntime()
   const start = Date.now()
@@ -746,7 +490,7 @@ async function waitForReady(
     try {
       if (hostId && !isSelf(hostId)) {
         const host = getHostById(hostId)
-        if (host && await isRemoteSessionReady(host.url, sessionName)) {
+        if (host && await isRemoteSessionReady(host.url, sessionName, strictRemote ? readyMarker : undefined)) {
           console.log(`[Ensemble] ${sessionName} is remotely reachable (${Math.round((Date.now() - start) / 1000)}s)`)
           return true
         }
@@ -757,7 +501,7 @@ async function waitForReady(
         const foreground = runtime.getForegroundCommand
           ? await runtime.getForegroundCommand(sessionName)
           : ''
-        if (isShellCommand(foreground)) {
+        if (!foreground || isShellCommand(foreground)) {
           if (Date.now() - start >= AGENT_START_GRACE_MS) {
             console.error(`[Ensemble] ${sessionName}: agent CLI is not running (${foreground} in foreground)`)
             return false
@@ -771,9 +515,9 @@ async function waitForReady(
           const now = Date.now()
           if (gate.name !== lastGateName || now - lastGateHandledAt >= 3000) {
             if (gate.keys === 'down-enter') {
-              await runtime.sendKeys(sessionName, 'Down', { enter: true })
+              await runtime.sendKeys(sessionName, 'Down', { enter: true, agentInput: true })
             } else {
-              await runtime.sendKeys(sessionName, 'Enter')
+              await runtime.sendKeys(sessionName, 'Enter', { agentInput: true })
             }
             lastGateName = gate.name
             lastGateHandledAt = now
@@ -782,7 +526,7 @@ async function waitForReady(
           await new Promise(r => setTimeout(r, 1000))
           continue
         }
-        if (output.includes(readyMarker)) {
+        if (readyMarker && output.includes(readyMarker)) {
           console.log(`[Ensemble] ${sessionName} is ready (${Math.round((Date.now() - start) / 1000)}s)`)
           return true
         }
@@ -802,6 +546,19 @@ function teamEvent(team: EnsembleTeam, event: BrainEvent['event'], fields: Parti
 export async function createEnsembleTeam(
   request: CreateTeamRequest
 ): Promise<ServiceResult<{ team: EnsembleTeam }>> {
+  if (!request || typeof request.name !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,79}$/.test(request.name) ||
+      typeof request.description !== 'string' || !request.description.trim() ||
+      (request.workingDirectory !== undefined && typeof request.workingDirectory !== 'string') ||
+      (request.requireLeadReady !== undefined && typeof request.requireLeadReady !== 'boolean') ||
+      (request.stagedConfig !== undefined &&
+        (!request.stagedConfig || typeof request.stagedConfig !== 'object' || Array.isArray(request.stagedConfig) ||
+          Object.values(request.stagedConfig).some(value => typeof value !== 'number' || !Number.isFinite(value) || value <= 0 || value > 86_400_000))) ||
+      (request.agents !== undefined && (!Array.isArray(request.agents) || request.agents.length > 20 ||
+        request.agents.some(agent => !agent || typeof agent.program !== 'string' ||
+          (agent.role !== undefined && typeof agent.role !== 'string') ||
+          (agent.hostId !== undefined && typeof agent.hostId !== 'string'))))) {
+    return { status: 400, error: 'Invalid team request' }
+  }
   let plan
   if (!request.agents?.length) {
     plan = await runPlan(request.description)
@@ -824,316 +581,301 @@ export async function createEnsembleTeam(
     }
   }
 
+  const leadIndexes = specs.flatMap((spec, index) => spec.role?.toLowerCase() === 'lead' ? [index] : [])
+  if (leadIndexes.length > 1) return { status: 400, error: 'Specify one Lead' }
+  const leadIndex = leadIndexes[0] ?? 0
+  request = { ...request, agents: specs.map((spec, index) => ({
+    ...spec, role: index === leadIndex ? 'lead' : spec.role || 'worker',
+  })) }
+  if (loadTeams().some(team => team.name === request.name && ['forming', 'active', 'paused', 'completed'].includes(team.status))) {
+    return { status: 409, error: 'An unfinished team already uses that name' }
+  }
   const team = createTeam(request)
-  const cwd = request.workingDirectory || process.cwd()
-  const worktreeMap = new Map<string, WorktreeInfo>()
+  startingTeams.add(team.id)
+  try {
+    const cwd = request.workingDirectory || process.cwd()
+    const worktreeMap = new Map<string, WorktreeInfo>()
 
-  if (plan) appendMessage(team.id, {
-    id: uuidv4(), teamId: team.id, from: 'ensemble', to: 'team', type: 'chat', timestamp: new Date().toISOString(),
-    content: `Brain plan: ${plan.agents.join(', ')}; template: ${request.templateName || 'default'}; reason: ${plan.reason || 'not provided'}`,
-  })
-  if (request.worktree === 'team') {
-    try {
-      const shared = await createTeamWorktree(team.id, cwd)
-      team.worktreePath = shared.path
-      team.worktreeBranch = shared.branch
-      updateTeam(team.id, { worktreePath: shared.path, worktreeBranch: shared.branch })
-    } catch (error) {
-      updateTeam(team.id, { status: 'failed' })
-      return { status: 400, error: error instanceof Error ? error.message : String(error) }
-    }
-  }
-
-  // Phase 0: Create worktrees for local agents if requested
-  if (request.useWorktrees && request.worktree !== 'team') {
-    for (let i = 0; i < team.agents.length; i++) {
-      const agentSpec = team.agents[i]
-      const hostId = specs[i].hostId
-        ? (getHostById(specs[i].hostId!) ? specs[i].hostId! : getSelfHostId())
-        : getSelfHostId()
-
-      // Only create worktrees for local agents
-      if (isSelf(hostId)) {
-        try {
-          const worktreeInfo = await createWorktree(team.id, agentSpec.name, cwd)
-          worktreeMap.set(agentSpec.name, worktreeInfo)
-          team.agents[i].worktreePath = worktreeInfo.path
-          team.agents[i].worktreeBranch = worktreeInfo.branch
-          appendMessage(team.id, {
-            id: uuidv4(), teamId: team.id, from: 'ensemble', to: 'team',
-            content: `🌳 Worktree created for ${agentSpec.name}: ${worktreeInfo.branch}`,
-            type: 'chat', timestamp: new Date().toISOString(),
-          })
-        } catch (err: unknown) {
-          const message = err instanceof Error ? err.message : String(err)
-          console.error(`[Ensemble] Failed to create worktree for ${agentSpec.name}:`, message)
-          appendMessage(team.id, {
-            id: uuidv4(), teamId: team.id, from: 'ensemble', to: 'team',
-            content: `⚠️ Worktree creation failed for ${agentSpec.name}: ${message}. Using shared directory.`,
-            type: 'chat', timestamp: new Date().toISOString(),
-          })
-        }
-      }
-    }
-  }
-
-  const buildPrompt = (agentName: string, otherNames: string[], agentIndex: number) => {
-    return buildPromptPreview({
-      teamId: team.id,
-      teamName: team.name,
-      description: team.description,
-      agentName,
-      teammateNames: otherNames,
-      agentIndex,
-      templateName: request.templateName,
+    if (plan) appendMessage(team.id, {
+      id: uuidv4(), teamId: team.id, from: 'ensemble', to: 'team', type: 'chat', timestamp: new Date().toISOString(),
+      content: `Brain plan: ${plan.agents.join(', ')}; template: ${request.templateName || 'default'}; reason: ${plan.reason || 'not provided'}`,
     })
-  }
-
-  // Sessies die dit team echt heeft. Postcheck, rescue en cleanup bepaalden dit
-  // eerder met een tmux-scan op de vorm van de sessienaam, waardoor het ene
-  // team de sessies van het andere meepakte. agentName hieronder is de ENE
-  // plek waar de sessienaam ontstaat; het register bewaart die letterlijk in
-  // plaats van 'm elders opnieuw samen te stellen uit team.name + agent.name.
-  const spawnedSessions: string[] = []
-  ensureCollabDirs(team.id)
-
-  // Phase 1: Spawn all agents
-  for (let i = 0; i < team.agents.length; i++) {
-    const agentSpec = team.agents[i]
-    const hostId = await routeToHost(agentSpec.program, specs[i].hostId)
-    const agentName = `${team.name}-${agentSpec.name}`
-    const prompt = buildPrompt(agentSpec.name, team.agents.filter((_, j) => j !== i).map(a => a.name), i)
-
-    ensureCollabDirs(team.id)
-    const promptFile = collabPromptFile(team.id, agentSpec.name)
-    fs.writeFileSync(promptFile, prompt)
-    console.log(`[Ensemble] Prompt for ${agentSpec.name}: ${prompt}`)
-
-    try {
-      let agentId: string
-      console.log(`[Ensemble] Spawning ${agentName} (${agentSpec.program}) on ${hostId} (self=${isSelf(hostId)})`)
-
-      if (isSelf(hostId)) {
-        const agentCwd = team.worktreePath || worktreeMap.get(agentSpec.name)?.path || cwd
-        if (team.worktreePath) {
-          agentSpec.worktreePath = team.worktreePath
-          agentSpec.worktreeBranch = team.worktreeBranch
-        }
-        const spawned = await spawnLocalAgent({
-          name: agentName,
-          program: agentSpec.program,
-          workingDirectory: agentCwd,
-          hostId,
-        })
-        agentId = spawned.id
-      } else {
-        const host = getHostById(hostId)
-        if (!host) throw new Error(`Unknown host: ${hostId}`)
-        const remote = await spawnRemote(host.url, agentName, agentSpec.program, cwd, team.description, team.name)
-        agentId = remote.id
+    if (request.worktree === 'team') {
+      try {
+        const shared = await createTeamWorktree(team.id, cwd)
+        team.worktreePath = shared.path
+        team.worktreeBranch = shared.branch
+        updateTeam(team.id, { worktreePath: shared.path, worktreeBranch: shared.branch })
+      } catch (error) {
+        updateTeam(team.id, { status: 'failed' })
+        return { status: 400, error: error instanceof Error ? error.message : String(error) }
       }
-
-      team.agents[i].agentId = agentId
-      team.agents[i].hostId = hostId
-      team.agents[i].status = 'active'
-      spawnedSessions.push(agentName)
-      // Meteen wegschrijven, niet pas na de lus: valt de service om terwijl de
-      // volgende agent opstart, dan staan de sessies die al draaien er toch in.
-      fs.appendFileSync(collabSessionsFile(team.id), `${agentName}\n`)
-
-      // Record what was actually launched, not just what was asked for. The
-      // requested name and the resolved command can differ, and when they do you
-      // want it in the archive rather than having to dig through tmux panes
-      // afterwards to find out which model really answered.
-      const resolution = resolveAgentProgramDetailed(agentSpec.program)
-      const via = resolution.how === 'exact'
-        ? resolution.agent.command
-        : `${resolution.agent.command} (matched via ${resolution.how})`
-      appendMessage(team.id, {
-        id: uuidv4(), teamId: team.id, from: 'ensemble', to: 'team',
-        content: `${agentSpec.name} (${agentSpec.program} → ${via} @ ${hostId}) has joined #${team.name}`,
-        type: 'chat', timestamp: new Date().toISOString(),
-      })
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err)
-      console.error(`[Ensemble] Failed to spawn ${agentName}:`, message)
-      team.agents[i].status = 'idle'
-      teamEvent(team, 'agent_failed', { agent: agentSpec.name, detail: message })
-      appendMessage(team.id, {
-        id: uuidv4(), teamId: team.id, from: 'ensemble', to: 'team',
-        content: `Failed to spawn ${agentName}: ${message}`,
-        type: 'chat', timestamp: new Date().toISOString(),
-      })
-    }
-  }
-
-  // Register schrijven vóórdat Phase 2 begint met afleveren. Loopt de service
-  // hierna vast (bijvoorbeeld tijdens het wachten op ready), dan bestaat het
-  // register alsnog en kan rescue de prompts later opnieuw afleveren in plaats
-  // van te weigeren met "geen sessieregister" — precies het scenario waarvoor
-  // rescue bedoeld is.
-
-  team.status = 'active'
-  updateTeam(team.id, { ...team, status: 'active' })
-  teamEvent(team, 'team_started', { agents: team.agents.map(a => a.program), cwd: team.worktreePath || cwd, branch: team.worktreeBranch })
-
-  // Phase 2: Wait for ALL agents to be ready, then inject prompts
-  const activeAgents = team.agents.filter(a => a.status === 'active')
-  if (activeAgents.length > 0) {
-    const runtime = getRuntime()
-
-    console.log(`[Ensemble] Waiting for all ${activeAgents.length} agents to be ready...`)
-    const readyResults = await Promise.all(
-      activeAgents.map(agent => {
-        const sessionName = `${team.name}-${agent.name}`
-        return waitForReady(sessionName, agent.program, agent.hostId).then(ready => ({ agent, sessionName, ready }))
-      })
-    )
-
-    const ready = readyResults.filter(r => r.ready)
-    for (const { agent } of ready) teamEvent(team, 'agent_ready', { agent: agent.name })
-    const notReady = readyResults.filter(r => !r.ready)
-
-    // Best-effort readiness — Codex CLI in particular often misses the readyMarker
-    // while being functionally ready. Don't abort; warn and proceed with prompt
-    // injection for ALL agents whose tmux session exists. Their CLI will buffer
-    // the paste and process it when they reach the input prompt.
-    for (const nr of notReady) {
-      console.warn(`[Ensemble] ${nr.sessionName} did not signal ready in time — attempting prompt injection anyway`)
-      appendMessage(team.id, {
-        id: uuidv4(), teamId: team.id, from: 'ensemble', to: 'team',
-        content: `⚠ ${nr.agent.name} did not signal ready in time — injecting prompt anyway (best-effort)`,
-        type: 'chat', timestamp: new Date().toISOString(),
-      })
     }
 
-    // Use all agents for injection. Only abort if literally zero agents have a session.
-    const injectTargets = readyResults
-    if (injectTargets.length === 0) {
-      appendMessage(team.id, {
-        id: uuidv4(), teamId: team.id, from: 'ensemble', to: 'team',
-        content: `❌ Team start aborted: no agents available for prompt injection`,
-        type: 'chat', timestamp: new Date().toISOString(),
-      })
-      return { data: { team }, status: 201 }
-    }
-    if (notReady.length > 0) {
-      // Give the non-ready agents a small extra grace window before pasting,
-      // so any in-progress trust prompts or async init can complete.
-      await new Promise(r => setTimeout(r, 3000))
-    }
+    // Phase 0: Create worktrees for local agents if requested
+    if (request.useWorktrees && request.worktree !== 'team') {
+      for (let i = 0; i < team.agents.length; i++) {
+        const agentSpec = team.agents[i]
+        const hostId = specs[i].hostId
+          ? (getHostById(specs[i].hostId!) ? specs[i].hostId! : getSelfHostId())
+          : getSelfHostId()
 
-    await new Promise(r => setTimeout(r, 2000))
-
-    // Phase 3: Inject prompts (skip if staged — staged workflow handles its own prompts)
-    // Staged coordination requires multiple agents; a solo agent uses normal delivery.
-    if (request.staged && activeAgents.length >= 2) {
-      // Staged mode: skip normal prompt injection, run plan→exec→verify workflow
-      appendMessage(team.id, {
-        id: uuidv4(), teamId: team.id, from: 'ensemble', to: 'team',
-        content: `🚀 ${injectTargets.length}/${activeAgents.length} agents — starting staged workflow (plan → exec → verify)`,
-        type: 'chat', timestamp: new Date().toISOString(),
-      })
-
-      const buildStagedPlanPrompt = (agentName: string, otherNames: string[], agentIndex: number): string => [
-        buildPrompt(agentName, otherNames, agentIndex),
-        `STAGED WORKFLOW MODE.`,
-        `PHASE 1 PLAN: ONLY create and share a plan via team-say.`,
-        `Do NOT write code, edit files, or run mutating commands yet.`,
-        `Both agents must share their plan before implementation begins.`,
-        `After sharing your plan, run team-read and align on the execution approach.`,
-      ].join(' ')
-
-      const buildStagedExecPrompt = (otherNames: string[]): string => [
-        `PHASE 2 EXEC: Planning is complete.`,
-        `You may now execute the agreed plan and make code changes.`,
-        `Share concrete progress via team-say and explicitly report when your implementation is done.`,
-        `Keep coordinating with ${otherNames.join(', ')} as you work.`,
-      ].join(' ')
-
-      const buildStagedVerifyPrompt = (teammateToReview?: string): string => [
-        `PHASE 3 VERIFY: Review ${teammateToReview || 'your teammate'}'s work.`,
-        `Inspect what they changed, compare it against the plan, and report findings via team-say.`,
-        `Focus on bugs, regressions, missing tests, and mismatches with the agreed approach.`,
-      ].join(' ')
-
-      // Run in background so createEnsembleTeam returns immediately
-      runStagedWorkflow(team, request.stagedConfig, {
-        buildPlanPrompt: ({ agent, teammates, index }) => buildStagedPlanPrompt(agent.name, teammates, index),
-        buildExecPrompt: ({ teammates }) => buildStagedExecPrompt(teammates),
-        buildVerifyPrompt: ({ teammateToReview }) => buildStagedVerifyPrompt(teammateToReview),
-      }).catch(err => {
-        const message = err instanceof Error ? err.message : String(err)
-        console.error(`[Ensemble] Staged workflow failed for ${team.id}:`, message)
-        appendMessage(team.id, {
-          id: uuidv4(), teamId: team.id, from: 'ensemble', to: 'team',
-          content: `❌ Staged workflow failed: ${message}`,
-          type: 'chat', timestamp: new Date().toISOString(),
-        })
-      })
-    } else {
-      // Normal mode: inject prompts simultaneously
-      console.log(`[Ensemble] Injecting prompts into ${injectTargets.length} agents (${ready.length} ready, ${notReady.length} best-effort)`)
-      await Promise.all(
-        injectTargets.map(async ({ agent, sessionName }) => {
-          const promptFile = collabPromptFile(team.id, agent.name)
+        // Only create worktrees for local agents
+        if (isSelf(hostId)) {
           try {
-            if (agent.hostId && !isSelf(agent.hostId)) {
-              const host = getHostById(agent.hostId)
-              if (host) {
-                const prompt = fs.readFileSync(promptFile, 'utf-8')
-                await postRemoteSessionCommand(host.url, sessionName, prompt)
-              }
-            } else {
-              const agentCfg = resolveAgentProgram(agent.program)
-              if (agentCfg.inputMethod === 'pasteFromFile') {
-                await runtime.pasteFromFile(sessionName, promptFile)
-              } else {
-                const prompt = fs.readFileSync(promptFile, 'utf-8')
-                await runtime.sendKeys(sessionName, prompt, { literal: true, enter: true, agentInput: true })
-              }
-              // Claude sometimes shows "[Pasted text" and needs an extra Enter to submit
-              if (agent.program.toLowerCase().includes('claude')) {
-                for (const delayMs of [1500, 3000, 6000]) {
-                  await new Promise(resolve => setTimeout(resolve, delayMs))
-                  const pane = await runtime.capturePane(sessionName, 80)
-                  if (!/\[Pasted text/i.test(pane)) break
-                  await runtime.sendKeys(sessionName, 'Enter')
-                }
-              }
-            }
-            console.log(`[Ensemble] ✓ Prompt injected into ${sessionName}`)
-          } catch (err) {
-            const message = err instanceof Error ? err.message : String(err)
-            if (err instanceof Error && err.name === 'AgentNotRunningError') {
-              agent.status = 'failed'
-              markAgentFailed(team.id, agent.name)
-            }
+            const worktreeInfo = await createWorktree(team.id, agentSpec.name, cwd)
+            worktreeMap.set(agentSpec.name, worktreeInfo)
+            team.agents[i].worktreePath = worktreeInfo.path
+            team.agents[i].worktreeBranch = worktreeInfo.branch
             appendMessage(team.id, {
               id: uuidv4(), teamId: team.id, from: 'ensemble', to: 'team',
-              content: `❌ Delivery to ${agent.name} failed: ${message}`,
+              content: `🌳 Worktree created for ${agentSpec.name}: ${worktreeInfo.branch}`,
               type: 'chat', timestamp: new Date().toISOString(),
             })
-            console.error(`[Ensemble] ✗ Failed to inject prompt into ${sessionName}:`, err)
+          } catch (err: unknown) {
+            const message = err instanceof Error ? err.message : String(err)
+            console.error(`[Ensemble] Failed to create worktree for ${agentSpec.name}:`, message)
+            appendMessage(team.id, {
+              id: uuidv4(), teamId: team.id, from: 'ensemble', to: 'team',
+              content: `⚠️ Worktree creation failed for ${agentSpec.name}: ${message}. Using shared directory.`,
+              type: 'chat', timestamp: new Date().toISOString(),
+            })
           }
-        })
-      )
+        }
+      }
+    }
 
-      appendMessage(team.id, {
-        id: uuidv4(), teamId: team.id, from: 'ensemble', to: 'team',
-        content: `🚀 ${injectTargets.length} agents received their task — collaboration started${notReady.length ? ` (${notReady.length} via best-effort fallback)` : ''}`,
-        type: 'chat', timestamp: new Date().toISOString(),
-      })
+    // Sessies die dit team echt heeft. Postcheck, rescue en cleanup bepaalden dit
+    // eerder met een tmux-scan op de vorm van de sessienaam, waardoor het ene
+    // team de sessies van het andere meepakte. agentName hieronder is de ENE
+    // plek waar de sessienaam ontstaat; het register bewaart die letterlijk in
+    // plaats van 'm elders opnieuw samen te stellen uit team.name + agent.name.
+    ensureCollabDirs(team.id)
+    fs.mkdirSync(collabRuntimeDir(team.id), { recursive: true })
+    fs.writeFileSync(path.join(collabRuntimeDir(team.id), '.managed-workflow'), '')
+
+    const requireLeadReady = request.requireLeadReady ?? team.agents.length > 1
+    const lead = team.agents[leadIndex]
+    team.workflow = {
+      state: 'STARTING', requireLeadReady, lead: lead.name, staged: request.staged, stagedConfig: request.stagedConfig,
+      startupDeadline: new Date(Date.now() + (request.stagedConfig?.planTimeoutMs ?? 120_000)).toISOString(),
+      baseline: readBaseline(team.worktreePath || cwd),
+      fileOwners: {}, taskOwners: {}, submitted: {}, blockers: {}, decisions: [], approvedChanges: [], handled: [],
+    }
+    updateTeam(team.id, { workflow: team.workflow, agents: team.agents })
+    const ordered = [leadIndex, ...team.agents.map((_, index) => index).filter(index => index !== leadIndex)]
+    const launches = await Promise.all(team.agents.map(async (agent, index) => {
+      const hostId = await routeToHost(agent.program, specs[index].hostId)
+      const workingDirectory = team.worktreePath || worktreeMap.get(agent.name)?.path || cwd
+      const prepared = isSelf(hostId) ? await prepareLocalAgent(agent.program, workingDirectory) : undefined
+      return { hostId, workingDirectory, prepared }
+    })).catch(error => {
+      recordSystemMessage(team.id, `Preflight failed: ${error instanceof Error ? error.message : 'configured CLI unavailable'}`)
+      return undefined
+    })
+    if (!launches) {
+      await disbandTeam(team.id, 'Assigned CLI preflight failed')
+      return { status: 503, error: 'Assigned CLI preflight failed', data: { team: getTeam(team.id) ?? team } }
+    }
+    for (const index of ordered) {
+      if (lifecycleWork.has(team.id) || getTeam(team.id)?.status !== 'forming') break
+      const agent = team.agents[index]
+      const { hostId, workingDirectory, prepared } = launches[index]
+      const name = `${team.name}-${agent.name}`
+      try {
+        if (isSelf(hostId)) {
+          if (team.worktreePath) {
+            agent.worktreePath = team.worktreePath
+            agent.worktreeBranch = team.worktreeBranch
+          }
+          const spawned = await spawnLocalAgent({ name, program: agent.program, workingDirectory, hostId, ...(prepared ? { prepared } : {}) })
+          agent.agentId = spawned.id
+          agent.sessionName = spawned.sessionName || name
+        } else {
+          const host = getHostById(hostId)
+          if (!host) throw new Error('Configured remote host is unavailable')
+          // Do not send the task description through Maestro before the plan gate.
+          const spawned = await spawnRemote(host.url, name, agent.program, cwd, undefined, team.name)
+          agent.agentId = spawned.id
+          agent.sessionName = name
+        }
+        agent.hostId = hostId
+        agent.status = 'active'
+        agent.startup = 'session_created'
+        agent.startedAt = new Date().toISOString()
+        fs.appendFileSync(collabSessionsFile(team.id), `${agent.sessionName}\n`)
+        updateTeam(team.id, { agents: team.agents })
+        if (!await waitForReady(agent.sessionName, agent.program, hostId, undefined, requireLeadReady)) throw new Error('CLI did not signal ready')
+        agent.startup = 'cli_ready'
+        updateTeam(team.id, { agents: team.agents })
+        teamEvent(team, 'agent_ready', { agent: agent.name })
+        if (lifecycleWork.has(team.id) || getTeam(team.id)?.status !== 'forming') throw new Error('Team stopped during startup')
+        if (agent === lead || !requireLeadReady) await deliverInitialPrompt(team, agent, request.templateName)
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : 'Agent startup failed'
+        if (agent.agentId) await stopAgent(team, agent)
+        agent.status = 'failed'
+        updateTeam(team.id, { agents: team.agents })
+        teamEvent(team, 'agent_failed', { agent: agent.name, detail })
+        recordSystemMessage(team.id, `Failed to start ${agent.name}: ${detail}`)
+        if (agent === lead) {
+          await disbandTeam(team.id, `Lead ${agent.name} could not start: ${detail}`)
+          return { status: 503, error: 'Lead startup failed', data: { team: getTeam(team.id) ?? team } }
+        }
+      }
+    }
+    if (getTeam(team.id)?.status !== 'forming') {
+      await Promise.all(team.agents.filter(agent => agent.status === 'active').map(agent => stopAgent(team, agent)))
+      return { status: 409, error: 'Team stopped during startup' }
+    }
+    team.status = 'active'
+    team.workflow.state = 'WAITING_PLAN'
+    team.workflow.startupDeadline = new Date(Date.now() + (request.stagedConfig?.planTimeoutMs ?? 120_000)).toISOString()
+    team.templateName = request.templateName
+    updateTeam(team.id, team)
+    teamEvent(team, 'team_started', { agents: team.agents.map(agent => agent.program), cwd: team.worktreePath || cwd, branch: team.worktreeBranch })
+    return { data: { team }, status: 201 }
+  } finally {
+    startingTeams.delete(team.id)
+  }
+}
+
+const startingTeams = new Set<string>()
+
+function recordSystemMessage(teamId: string, content: string): void {
+  appendMessage(teamId, { id: uuidv4(), teamId, from: 'ensemble', to: 'team', content, type: 'chat', timestamp: new Date().toISOString() })
+}
+
+async function stopAgent(team: EnsembleTeam, agent: EnsembleTeam['agents'][number]): Promise<void> {
+  if (agent.hostId && !isSelf(agent.hostId)) {
+    const host = getHostById(agent.hostId)
+    if (host && agent.agentId) await killRemoteAgent(host.url, agent.agentId)
+  } else await killLocalAgent(agent.sessionName || `${team.name}-${agent.name}`)
+}
+
+async function deliverInitialPrompt(team: EnsembleTeam, agent: EnsembleTeam['agents'][number], templateName?: string): Promise<void> {
+  const sessionName = agent.sessionName || `${team.name}-${agent.name}`
+  const runtime = getRuntime()
+  const prompt = buildPromptPreview({
+    teamId: team.id, teamName: team.name, description: team.description, agentName: agent.name,
+    teammateNames: team.agents.filter(other => other !== agent && other.status !== 'failed').map(other => other.name),
+    agentIndex: team.agents.indexOf(agent), role: agent.role, templateName, staged: team.workflow?.staged,
+  })
+  const promptFile = collabPromptFile(team.id, agent.name)
+  fs.writeFileSync(promptFile, prompt, { mode: 0o600 })
+  if (agent.hostId && !isSelf(agent.hostId)) {
+    const host = getHostById(agent.hostId)
+    if (!host) throw new Error('Configured remote host is unavailable')
+    await postRemoteSessionCommand(host.url, sessionName, prompt)
+  } else {
+    const config = resolveAgentProgram(agent.program)
+    if (config.inputMethod === 'pasteFromFile') await pasteAgentInput(runtime, sessionName, promptFile, prompt, config.pasteEnterCount)
+    else await runtime.sendKeys(sessionName, prompt.replace(/[\r\n]+/g, ' '), { literal: true, enter: true, agentInput: true })
+  }
+  agent.startup = 'prompt_delivered'
+  updateTeam(team.id, { agents: team.agents })
+}
+
+async function processManagedTeam(team: EnsembleTeam): Promise<void> {
+  let workflow = team.workflow!
+  if (workflow.state === 'DONE') return
+  const processed = new Set(workflow.handled)
+  for (const message of getMessages(team.id)) {
+    if (processed.has(message.id) || !message.content.startsWith('<<COLLAB_EVENT>> ')) continue
+    const candidate = structuredClone(workflow)
+    let response: string | undefined
+    const controller = new AbortController()
+    acceptanceControllers.set(team.id, controller)
+    try {
+      response = await applyWorkflowCommand(team, candidate, message, controller.signal)
+      workflow = candidate
+    } catch (error) {
+      response = `Workflow command rejected: ${error instanceof Error ? error.message : 'invalid event'}`
+    } finally {
+      acceptanceControllers.delete(team.id)
+    }
+    workflow.handled.push(message.id)
+    const latest = getTeam(team.id)
+    if (!latest || latest.status !== 'active' || latest.workflow?.lead !== workflow.lead || lifecycleWork.has(team.id)) return
+    team.workflow = workflow
+    updateTeam(team.id, { workflow })
+    if (response) recordSystemMessage(team.id, response)
+    if (team.workflow.state === 'DONE') return
+  }
+  if (!await reconcileManagedAgents(team) || !workflow.plan) return
+  for (const agent of team.agents) {
+    if (agent.startup !== 'cli_ready' || agent.status !== 'active' || agent.name === workflow.lead) continue
+    if (getTeam(team.id)?.status !== 'active' || lifecycleWork.has(team.id)) return
+    try {
+      if (!await waitForReady(agent.sessionName || `${team.name}-${agent.name}`, agent.program, agent.hostId, 5000, workflow.requireLeadReady)) throw new Error('Worker CLI is no longer ready')
+      await deliverInitialPrompt(team, agent, team.templateName)
+    } catch (error) {
+      await stopAgent(team, agent)
+      agent.status = 'failed'
+      updateTeam(team.id, { agents: team.agents })
+      recordSystemMessage(team.id, `Worker ${agent.name} could not receive its prompt: ${error instanceof Error ? error.message : 'delivery failed'}`)
     }
   }
+}
 
-  return { data: { team }, status: 201 }
+async function reconcileManagedAgents(team: EnsembleTeam): Promise<boolean> {
+  const workflow = team.workflow!
+  if (team.pendingReplacement) {
+    if (!await recoverPendingReplacement(team.id, team.pendingReplacement)) {
+      await disbandTeam(team.id, 'Could not confirm shutdown of a partially started replacement')
+      return false
+    }
+    updateTeam(team.id, { pendingReplacement: undefined })
+  }
+  // Resolve the Lead before attempting worker recovery or issuing prompts.
+  const agents = team.agents.filter(agent => agent.status === 'active')
+  agents.sort((a, b) => Number(b.name === workflow.lead) - Number(a.name === workflow.lead))
+  if (!agents.some(agent => agent.name === workflow.lead)) {
+    await disbandTeam(team.id, 'The Lead is unavailable')
+    return false
+  }
+  for (const agent of agents) {
+    const session = agent.sessionName || `${team.name}-${agent.name}`
+    const remote = agent.hostId && !isSelf(agent.hostId)
+    const host = remote ? getHostById(agent.hostId) : undefined
+    const exists = remote
+      ? host ? await isRemoteSessionReady(host.url, session) : undefined
+      : await getRuntime().sessionExists(session)
+    if (getTeam(team.id)?.status !== 'active' || lifecycleWork.has(team.id)) return false
+    if (exists === undefined && agent.name === workflow.lead) return false
+    let reason = exists === false ? 'session disappeared' : undefined
+    if (!remote && exists) {
+      const foreground = await getRuntime().getForegroundCommand?.(session)
+      if (foreground && isShellCommand(foreground)) reason = 'CLI exited to a shell'
+    }
+    if (!reason || (agent.name !== workflow.lead && workflow.submitted[agent.name])) continue
+    if (agent.name === workflow.lead) {
+      // Once workers have entered implementation their shells cannot be
+      // reliably frozen across runtimes. Terminate and keep the worktree.
+      if (workflow.state === 'WAITING_PLAN' && !agents.some(other =>
+          other !== agent && other.startup === 'prompt_delivered') &&
+          await replaceTeamAgent(team.id, agent.name, reason, waitForReady)) return false
+      await disbandTeam(team.id, `Lead ${agent.name} failed: ${reason}`)
+      return false
+    }
+    if (await replaceTeamAgent(team.id, agent.name, reason, waitForReady)) return false
+    if (getTeam(team.id)?.status !== 'active' || lifecycleWork.has(team.id)) return false
+    if (exists) await stopAgent(team, agent)
+    agent.status = 'failed'
+    if (!workflow.submitted[agent.name]) {
+      workflow.blockers[agent.name] = reason
+      workflow.state = 'BLOCKED'
+    }
+    updateTeam(team.id, { agents: team.agents, workflow })
+    recordSystemMessage(team.id, `Worker ${agent.name} failed: ${reason}. Lead can take over its assignment.`)
+  }
+  return true
 }
 
 export function getEnsembleTeam(teamId: string): ServiceResult<{ team: EnsembleTeam; messages: EnsembleMessage[] }> {
   const team = getTeam(teamId)
   if (!team) return { error: 'Team not found', status: 404 }
-  return { data: { team, messages: getMessages(teamId) }, status: 200 }
+  return { data: { team, messages: getTeamFeed(teamId).data?.messages ?? [] }, status: 200 }
 }
 
 export function listEnsembleTeams(): ServiceResult<{ teams: EnsembleTeam[] }> {
@@ -1144,72 +886,126 @@ export async function checkIdleTeams(): Promise<void> {
   await ensembleService.checkIdleTeams()
 }
 
-export function getTeamFeed(teamId: string, since?: string): ServiceResult<{ messages: EnsembleMessage[] }> {
+export function getTeamFeed(teamId: string, since?: string, recipient?: string): ServiceResult<{ messages: EnsembleMessage[] }> {
   const team = getTeam(teamId)
   if (!team) return { error: 'Team not found', status: 404 }
-  return { data: { messages: getMessages(teamId, since) }, status: 200 }
+  const messages = getMessages(teamId)
+  const receipts = new Map<string, Map<string, string>>()
+  for (const message of messages) {
+    if (!message.content.startsWith(receiptPrefix)) continue
+    try {
+      const ids: unknown = JSON.parse(message.content.slice(receiptPrefix.length))
+      if (!Array.isArray(ids)) continue
+      for (const id of ids) {
+        if (typeof id !== 'string') continue
+        if (!receipts.has(id)) receipts.set(id, new Map())
+        const readers = receipts.get(id)!
+        if (!readers.has(message.from)) readers.set(message.from, message.timestamp)
+      }
+    } catch { /* Ignore malformed read receipts. */ }
+  }
+  return {
+    status: 200,
+    data: { messages: messages.filter(message =>
+      !message.content.startsWith(receiptPrefix) &&
+      (!since || message.timestamp > since) &&
+      (!recipient || (message.from !== recipient && (message.to === recipient || message.to === 'team')))
+    ).map(message => {
+      const readers = receipts.get(message.id)
+      const queued = message.delivery ?? (team.workflow ? team.agents
+        .filter(agent => agent.name !== message.from && (message.to === 'team' || message.to === agent.name))
+        .map(agent => ({ recipient: agent.name, status: 'queued' as const, at: message.timestamp, method: 'pull' as const })) : undefined)
+      if (!queued) return message
+      return { ...message, delivery: queued.map(delivery => {
+        const at = readers?.get(delivery.recipient)
+        if (at && delivery.method === 'pull') return { ...delivery, status: 'delivered' as const, at }
+        if (delivery.method === 'pane' && delivery.status === 'queued' && !pushing.has(`${teamId}:${message.id}`)) {
+          return { ...delivery, status: 'failed' as const, reason: 'Delivery interrupted or unconfirmed' }
+        }
+        return delivery
+      }) }
+    }) },
+  }
 }
+
+const pushing = new Map<string, Promise<unknown>>()
 
 export async function sendTeamMessage(
   teamId: string, to: string, content: string, from?: string,
-  existingId?: string, existingTimestamp?: string,
+  existingId?: string, existingTimestamp?: string, priority?: 'normal' | 'urgent',
 ): Promise<ServiceResult<{ message: EnsembleMessage }>> {
   const team = getTeam(teamId)
   if (!team) return { error: 'Team not found', status: 404 }
-
+  if (typeof content !== 'string' || !content.trim() || typeof to !== 'string' ||
+      (from !== undefined && typeof from !== 'string') ||
+      (existingId !== undefined && typeof existingId !== 'string')) {
+    return { error: 'Invalid message', status: 400 }
+  }
+  const sender = from || 'user'
+  const id = existingId || uuidv4()
+  const key = `${teamId}:${id}`
+  const original = existingId ? getMessages(teamId).find(message => message.id === existingId) : undefined
+  if (original && (original.from !== sender || original.to !== to || original.content !== content)) {
+    return { error: 'Message id is already in use', status: 409 }
+  }
+  if (original?.delivery) {
+    await pushing.get(key)
+    return { status: 200, data: { message: getMessages(teamId).find(message => message.id === id) ?? original } }
+  }
+  const timestamp = new Date().toISOString()
+  const recipients = (team.status === 'active' || (team.status === 'forming' && !!team.workflow)) &&
+    (!isWorkflowCommand(content) || (!!team.workflow && !content.startsWith(receiptPrefix)))
+    ? team.agents.filter(agent => agent.status === 'active' && agent.name !== sender && (to === 'team' || to === agent.name))
+    : []
   const message: EnsembleMessage = {
-    id: existingId || uuidv4(), teamId, from: from || 'user', to, content,
-    type: 'chat', timestamp: existingTimestamp || new Date().toISOString(),
+    id, teamId, from: sender, to, content, type: 'chat',
+    timestamp: original?.timestamp || (team.workflow ? timestamp :
+      (existingTimestamp && Number.isFinite(Date.parse(existingTimestamp)) ? existingTimestamp : timestamp)),
+    priority: priority === 'urgent' ? 'urgent' : 'normal',
+    delivery: recipients.map(agent => ({ recipient: agent.name, status: 'queued', at: timestamp, method: team.workflow ? 'pull' : 'pane' })),
   }
   appendMessage(teamId, message)
+  if (team.workflow || !recipients.length) return { data: { message }, status: 200 }
 
-  // Determine which agents should receive this message in their tmux pane
-  const sender = from || 'user'
-  const recipients = to === 'team'
-    ? team.agents.filter(a => a.status === 'active' && a.name !== sender)
-    : team.agents.filter(a => a.status === 'active' && a.name === to)
-
-  const runtime = getRuntime()
-
-  for (const targetAgent of recipients) {
-    try {
-      const sessionName = `${team.name}-${targetAgent.name}`
-
-      // Skip delivery if the agent's tmux pane no longer exists (agent finished and exited)
-      const paneAlive = await runtime.sessionExists(sessionName)
-      if (!paneAlive) continue
-
-      // Wrap message with sender context + response nudge
-      const deliveryText = [
-        `[Team message from ${sender}]: ${content}`,
-        `→ Respond with team-say. Then run team-read to check for more messages.`,
-      ].join('\n')
-
-      if (targetAgent.hostId && !isSelf(targetAgent.hostId)) {
-        const host = getHostById(targetAgent.hostId)
-        if (host) await postRemoteSessionCommand(host.url, sessionName, deliveryText)
-      } else {
-        // Always use pasteFromFile for message delivery to avoid shell escaping issues
-        // (sendKeys breaks on ?, !, \ and other special chars in zsh)
-        const tmpFile = collabDeliveryFile(teamId, sessionName)
-        fs.mkdirSync(path.dirname(tmpFile), { recursive: true })
-        fs.writeFileSync(tmpFile, deliveryText)
-        await runtime.pasteFromFile(sessionName, tmpFile)
+  const work = Promise.all(recipients.map((agent, index) => {
+    const session = agent.sessionName || `${team.name}-${agent.name}`
+    const deliver = async () => {
+      const delivery = message.delivery![index]
+      try {
+        if (getTeam(teamId)?.status !== 'active') throw new Error('Team stopped')
+        const input = `[Team message from ${sender}]: ${content}`
+        if (agent.hostId && !isSelf(agent.hostId)) {
+          const host = getHostById(agent.hostId)
+          if (!host) throw new Error('Configured remote host is unavailable')
+          await postRemoteSessionCommand(host.url, session, input)
+        } else {
+          const runtime = getRuntime()
+          for (let attempt = 0; !await runtime.sessionExists(session); attempt++) {
+            if (attempt >= 2) throw new Error('Session unavailable')
+            await new Promise(resolve => setTimeout(resolve, 200 * 2 ** attempt))
+          }
+          const file = collabDeliveryFile(teamId, session)
+          fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
+          const temporary = `${file}.${uuidv4()}.tmp`
+          try {
+            fs.writeFileSync(temporary, input, { mode: 0o600 })
+            const count = resolveAgentProgram(agent.program).pasteEnterCount
+            if (count === undefined) await runtime.pasteFromFile(session, temporary)
+            else await runtime.pasteFromFile(session, temporary, { enterCount: count })
+          } finally { fs.rmSync(temporary, { force: true }) }
+        }
+        delivery.status = 'delivered'
+      } catch (error) {
+        delivery.status = 'failed'
+        delivery.reason = error instanceof Error && error.name === 'AgentNotRunningError' ? 'CLI not running' : 'Transport unavailable or delivery unconfirmed'
+        if (error instanceof Error && error.name === 'AgentNotRunningError') markAgentFailed(teamId, agent.name)
       }
-    } catch (err) {
-      const reason = err instanceof Error ? err.message : String(err)
-      if (err instanceof Error && err.name === 'AgentNotRunningError') {
-        targetAgent.status = 'failed'
-        markAgentFailed(team.id, targetAgent.name)
-      }
-      appendMessage(teamId, {
-        id: uuidv4(), teamId, from: 'ensemble', to: 'team',
-        content: `❌ Delivery to ${targetAgent.name} failed: ${reason}`,
-        type: 'chat', timestamp: new Date().toISOString(),
-      })
+      delivery.at = new Date().toISOString()
     }
-  }
-
+    return serializeAgentInput(`${agent.hostId || ''}:${session}`, deliver)
+  })).then(() => appendMessage(teamId, message))
+  pushing.set(key, work)
+  try { await work } finally { pushing.delete(key) }
   return { data: { message }, status: 200 }
 }
 
@@ -1272,7 +1068,7 @@ export async function writeDisbandSummary(
   if (!team) return
 
   const messages = getMessages(teamId)
-  const agentMsgs = messages.filter(m => m.from !== 'ensemble' && m.from !== 'user')
+  const agentMsgs = messages.filter(m => m.from !== 'ensemble' && m.from !== 'user' && !m.content.startsWith(receiptPrefix))
 
   // A run without agent messages used to return here and write nothing at all,
   // so the caller was left with an empty runtime dir and no explanation. That is
@@ -1296,7 +1092,7 @@ export async function writeDisbandSummary(
     team.agents
       .filter(a => a.status === 'active')
       .map(async (agent) => {
-        const sessionName = `${team.name}-${agent.name}`
+        const sessionName = agent.sessionName || `${team.name}-${agent.name}`
         tokenUsageMap[agent.name] = await getAgentTokenUsage(sessionName)
       })
   )
@@ -1329,20 +1125,35 @@ export async function writeDisbandSummary(
     `Task: ${team.description || 'unknown'}\nDuration: ${duration}\nMessages: ${agentMsgs.length}\nFull transcript: ${transcriptPointer}`
       + (team.worktreePath ? `\nWorktree: ${team.worktreePath}\nBranch: ${team.worktreeBranch}` : '')
       + (options.failureReason ? `\nReason: ${options.failureReason}` : '')
+      + (team.workflow?.report ? `\n\nLead's final report\n${team.workflow.report}` : '')
+      + (team.workflow?.acceptance ? `\nAcceptance evidence: ${team.workflow.acceptance.artifact}` : '')
       + `\n\n${summaryText}`,
   )
   console.log(`[Ensemble] Summary written to ${summaryFile}`)
 }
 
-export async function disbandTeam(teamId: string, failureReason?: string, finishStatus?: 'ok' | 'failed' | 'stopped'): Promise<ServiceResult<{ team: EnsembleTeam }>> {
+export function disbandTeam(teamId: string, failureReason?: string, finishStatus?: 'ok' | 'failed' | 'stopped'): Promise<ServiceResult<{ team: EnsembleTeam }>> {
+  const pending = lifecycleWork.get(teamId)
+  if (pending) return pending
+  const finalization = finalizeTeam(teamId, failureReason, finishStatus).finally(() => lifecycleWork.delete(teamId))
+  lifecycleWork.set(teamId, finalization)
+  return finalization
+}
+
+async function finalizeTeam(teamId: string, failureReason?: string, finishStatus?: 'ok' | 'failed' | 'stopped'): Promise<ServiceResult<{ team: EnsembleTeam }>> {
   const team = getTeam(teamId)
   if (!team) return { error: 'Team not found', status: 404 }
 
-  if (team.status === 'disbanded') return { data: { team }, status: 200 }
+  if (team.status === 'disbanded' || team.status === 'failed') return { data: { team }, status: 200 }
   stopTeamReplacements(teamId)
+  acceptanceControllers.get(teamId)?.abort()
+  updateTeam(teamId, { status: 'completed', failureReason })
 
   // Write summary before killing sessions so the Claude Code session can present it
   await writeDisbandSummary(teamId, failureReason ? { failureReason } : {})
+  if (team.pendingReplacement && await recoverPendingReplacement(teamId, team.pendingReplacement)) {
+    updateTeam(teamId, { pendingReplacement: undefined })
+  }
 
   // Scrape token usage BEFORE killing sessions (tmux panes disappear on kill)
   const tokenUsageMap: Record<string, string> = {}
@@ -1350,13 +1161,13 @@ export async function disbandTeam(teamId: string, failureReason?: string, finish
     team.agents
       .filter(a => a.status === 'active')
       .map(async (agent) => {
-        const sessionName = `${team.name}-${agent.name}`
+        const sessionName = agent.sessionName || `${team.name}-${agent.name}`
         tokenUsageMap[agent.name] = await getAgentTokenUsage(sessionName)
       })
   )
 
   for (const agent of team.agents) {
-    if (agent.status === 'active') {
+    if (agent.status === 'active' || (agent.status === 'failed' && agent.sessionName)) {
       appendMessage(teamId, {
         id: uuidv4(), teamId, from: 'ensemble', to: 'team',
         content: `${agent.name} has left #${team.name}`,
@@ -1364,12 +1175,7 @@ export async function disbandTeam(teamId: string, failureReason?: string, finish
       })
 
       try {
-        if (agent.hostId && !isSelf(agent.hostId)) {
-          const host = getHostById(agent.hostId)
-          if (host && agent.agentId) await killRemoteAgent(host.url, agent.agentId)
-        } else {
-          await killLocalAgent(`${team.name}-${agent.name}`)
-        }
+        await stopAgent(team, agent)
       } catch { /* session may already be gone */ }
     }
   }
@@ -1377,7 +1183,7 @@ export async function disbandTeam(teamId: string, failureReason?: string, finish
   const agentsWithWorktrees = team.agents.filter(
     a => a.status !== 'replaced' && a.worktreePath && a.worktreeBranch && (!a.hostId || isSelf(a.hostId))
   )
-  if (team.worktree !== 'team' && agentsWithWorktrees.length > 0) {
+  if (!team.workflow && team.worktree !== 'team' && agentsWithWorktrees.length > 0) {
     await new Promise(resolve => setTimeout(resolve, 2000))
 
     const firstWorktree = agentsWithWorktrees[0].worktreePath!
@@ -1407,12 +1213,24 @@ export async function disbandTeam(teamId: string, failureReason?: string, finish
         branch: agent.worktreeBranch!,
         agentName: agent.name,
       }
-      await destroyWorktree(worktreeInfo, basePath)
+      const clean = (() => {
+        try { return execFileSync('git', ['status', '--porcelain'], { cwd: worktreeInfo.path, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim() === '' }
+        catch { return false }
+      })()
+      const merged = (() => {
+        try { execFileSync('git', ['merge-base', '--is-ancestor', worktreeInfo.branch, 'HEAD'], { cwd: basePath, stdio: 'ignore' }); return true }
+        catch { return false }
+      })()
+      if (clean && merged) await destroyWorktree(worktreeInfo, basePath)
     }
   }
 
   const updated = updateTeam(teamId, {
-    status: 'disbanded',
+    status: (team.workflow && failureReason && !failureReason.startsWith('team stopped on time limit')) ? 'failed' : 'disbanded',
+    failureReason,
+    ...(finishStatus === 'ok' && team.workflow ? {
+      agents: team.agents.map(agent => agent.status === 'active' ? { ...agent, status: 'done' as const } : agent),
+    } : {}),
     completedAt: new Date().toISOString(),
   })
 
@@ -1512,11 +1330,6 @@ export async function disbandTeam(teamId: string, failureReason?: string, finish
  * verified against the actual messages that once ended a team too early.
  */
 export const __testing = {
-  hasCompletionSignal: isCompletionStatement,
-  TWO_SIGNAL_IDLE_THRESHOLD_MS,
-  SINGLE_SIGNAL_IDLE_THRESHOLD_MS,
-  COMPLETION_PATTERNS,
-  CONTINUATION_PATTERNS,
   afhandelenExport,
   memoryExportFailureMessage,
   postToAlertHub,

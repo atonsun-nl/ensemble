@@ -36,6 +36,7 @@ beforeEach(async () => {
     createTeam: vi.fn(), saveTeams: vi.fn(),
   }))
   vi.doMock('../lib/agent-spawner', () => ({
+      prepareLocalAgent: vi.fn(async () => undefined),
     spawnLocalAgent: vi.fn(), spawnRemoteAgent: vi.fn(), killLocalAgent: kill,
     killRemoteAgent: kill, getAgentTokenUsage: async () => 'unknown',
     postRemoteSessionCommand: vi.fn(), isRemoteSessionReady: vi.fn(),
@@ -68,7 +69,7 @@ it('leaves teams unlimited by default', async () => {
   expect(messages).toHaveLength(1)
   expect(current!.status).toBe('active')
 })
-it('delivers one deadline warning to all active agents despite recent activity', async () => {
+it('records one deadline warning without typing into panes despite recent activity', async () => {
   vi.setSystemTime(start + 9 * 60_000)
   await service.checkIdleTeams()
   expect(messages).toHaveLength(1)
@@ -76,8 +77,8 @@ it('delivers one deadline warning to all active agents despite recent activity',
   messages[0].timestamp = new Date().toISOString()
   await service.checkIdleTeams()
   await service.checkIdleTeams()
-  expect(messages.filter(m => m.content.includes('<<COLLAB_DONE>>'))).toHaveLength(1)
-  expect(paste.mock.calls).toHaveLength(2)
+  expect(messages.filter(m => m.content.startsWith('Time is up:'))).toHaveLength(1)
+  expect(paste).not.toHaveBeenCalled()
   expect(current!.status).toBe('active')
 })
 it('allows a full grace period after a late warning then writes the time-limit summary', async () => {
@@ -108,44 +109,23 @@ it.each([[[]], [['beta']], [['beta', 'gamma']]])('puts the preamble before the t
   expect(prompt.indexOf('Use project conventions.')).toBeGreaterThan(-1)
   expect(prompt.indexOf('Use project conventions.')).toBeLessThan(prompt.indexOf('Task: Inspect code'))
 })
-it('requires new information and no outstanding questions, without an approval loop', () => {
+it('uses Lead review and quiet pull delivery without completion acknowledgements', () => {
   const prompt = service.buildPromptPreview({ teamId: 'sample', teamName: 'sample', description: 'Inspect code', agentName: 'alpha', teammateNames: ['beta'], agentIndex: 0 })
-  expect(prompt).toContain('do not leave open questions addressed to you unresolved')
-  expect(prompt).toContain('Do not send status messages without new information')
-  expect(prompt).toContain('do not wait for an approval')
-  expect(prompt).toContain('EXACTLY the sentinel <<COLLAB_DONE>>')
-  expect(prompt).not.toContain('confirmed agreement')
+  expect(prompt).toContain('request machine acceptance')
+  expect(prompt).toContain('team-read.sh sample alpha')
+  expect(prompt).not.toContain('<<COLLAB_DONE>>')
 })
-it('invalidates a sentinel when another agent posts new content and requires a fresh sentinel', async () => {
-  const post = (from: string, content: string, seconds: number) => messages.push({
-    id: `review-${messages.length}`, teamId: current!.id, from, to: 'team', content,
-    type: 'chat', timestamp: new Date(start + seconds * 1000).toISOString(),
-  })
-  post('alpha', 'Implementation and verification complete', 1)
-  post('alpha', '<<COLLAB_DONE>>', 2)
-  post('beta', 'The fallback still loses the selected agent. Please fix it.', 3)
-  post('beta', '<<COLLAB_DONE>>', 4)
-  vi.setSystemTime(start + 5_000)
-  await service.checkIdleTeams()
-  expect(current!.status).toBe('active')
-  post('alpha', '<<COLLAB_DONE>>', 5)
-  await service.checkIdleTeams()
+it('finalizes a legacy team once despite duplicate sentinels and late status', async () => {
+  for (const [index, from, content] of [
+    [1, 'alpha', '<<COLLAB_DONE>>'], [2, 'beta', '<<COLLAB_DONE>>'],
+    [3, 'alpha', '<<COLLAB_DONE>>'], [4, 'beta', 'Late update'],
+  ] as const) {
+    messages.push({ id: String(index), teamId: current!.id, from, to: 'team', content, type: 'chat', timestamp: new Date(start + index * 1000).toISOString() })
+  }
+  await Promise.all([service.checkIdleTeams(), service.checkIdleTeams()])
   expect(current!.status).toBe('disbanded')
-})
-it('requires a sentinel strictly later than another agent content even at equal timestamps', async () => {
-  messages.push(...[
-    { from: 'alpha', content: '<<COLLAB_DONE>>' },
-    { from: 'beta', content: 'Check the fallback result' },
-    { from: 'beta', content: '<<COLLAB_DONE>>' },
-  ].map((m, i) => ({ ...m, id: `same-${i}`, teamId: current!.id, to: 'team', type: 'chat' as const, timestamp: new Date(start + 1000).toISOString() })))
-  vi.setSystemTime(start + 2000)
-  await service.checkIdleTeams()
-  expect(current!.status).toBe('active')
-})
-it('instructs agents to answer new content after a sentinel and send it again', () => {
-  const prompt = service.buildPromptPreview({ teamId: 'sample', teamName: 'sample', description: 'Inspect code', agentName: 'alpha', teammateNames: ['beta'], agentIndex: 0 })
-  expect(prompt).toContain('no unanswered teammate content or question after your last message')
-  expect(prompt).toContain('If new teammate content arrives after your sentinel, respond substantively and send the sentinel again')
+  expect(kill).toHaveBeenCalledTimes(2)
+  expect(messages.filter(message => message.content.startsWith('Auto-disband'))).toHaveLength(1)
 })
 it('states the configured grace period in the deadline warning', async () => {
   vi.setSystemTime(start + 10 * 60_000)
@@ -160,7 +140,7 @@ it('restores the deadline warning and its grace start from the feed after restar
   vi.setSystemTime(start + 12 * 60_000)
   await service.checkIdleTeams()
   expect(messages.filter(m => m.content.startsWith('Time is up:'))).toHaveLength(1)
-  expect(paste).toHaveBeenCalledTimes(2)
+  expect(paste).not.toHaveBeenCalled()
   expect(current!.status).toBe('active')
   vi.setSystemTime(start + 13 * 60_000)
   await service.checkIdleTeams()
@@ -177,34 +157,6 @@ it('makes the time limit the primary summary reason even when agents never poste
   expect(summary).not.toContain('points at prompt delivery')
   expect(summary).toContain('Messages: 0')
 })
-it('ends an idle all-sentinel team below ten messages despite later system chatter', async () => {
-  const post = (from: string, content: string, seconds: number) => messages.push({
-    id: `idle-${messages.length}`, teamId: current!.id, from, to: 'team', content,
-    type: 'chat', timestamp: new Date(start + seconds * 1000).toISOString(),
-  })
-  post('alpha', '<<COLLAB_DONE>>', 1)
-  post('beta', 'Finished checking; waiting for alpha', 2)
-  post('beta', '<<COLLAB_DONE>>', 3)
-  post('ensemble', 'Watchdog status update', 302)
-  vi.setSystemTime(start + 303_000)
-  await service.checkIdleTeams()
-  expect(current!.status).toBe('active')
-  vi.setSystemTime(start + 303_001)
-  await service.checkIdleTeams()
-  expect(current!.status).toBe('disbanded')
-})
-it('does not use the idle sentinel fallback if an agent posts new content after its sentinel', async () => {
-  messages.push(...[
-    { from: 'alpha', content: '<<COLLAB_DONE>>' },
-    { from: 'beta', content: 'Please check the result' },
-    { from: 'beta', content: '<<COLLAB_DONE>>' },
-    { from: 'alpha', content: 'Investigating a new issue' },
-  ].map((m, i) => ({ ...m, id: `reopen-${i}`, teamId: current!.id, to: 'team', type: 'chat' as const, timestamp: new Date(start + (i + 1) * 1000).toISOString() })))
-  vi.setSystemTime(start + 305_000)
-  await service.checkIdleTeams()
-  expect(current!.status).toBe('active')
-})
-
 it('sends no hub alert when its URL is unconfigured even with a secret', async () => {
   await service.disbandTeam(current!.id)
   expect(globalThis.fetch).not.toHaveBeenCalled()

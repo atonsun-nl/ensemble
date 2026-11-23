@@ -16,6 +16,8 @@ export interface AgentProgram {
   readyMarker: string
   /** How to deliver multi-line prompts */
   inputMethod: 'pasteFromFile' | 'sendKeys'
+  /** Enter presses after a paste; Grok needs one because a second sends now. */
+  pasteEnterCount?: 1 | 2
   /** Base color name for monitor TUI (e.g. "blue", "green", "magenta", "yellow") */
   color: string
   /** Single-char icon shown in monitor UI (e.g. "◆", "●", "▲", "★") */

@@ -128,20 +128,31 @@ if template:
     payload['templateName'] = template
 json.dump(payload, open(os.environ['PFILE'], 'w'))
 "
-RESULT=$(curl -sf -X POST "$API/api/ensemble/teams" \
-  -H "Content-Type: application/json" \
-  -d @"$PAYLOAD_FILE")
+if ! RESULT=$(ensemble_curl -sS -X POST "$API/api/ensemble/teams" \
+  -H "Content-Type: application/json" -d @"$PAYLOAD_FILE"); then
+  rm -f "$PAYLOAD_FILE"
+  exit 1
+fi
 rm -f "$PAYLOAD_FILE"
 
-TEAM_ID=$(echo "$RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin)['team']['id'])")
-RUNTIME_DIR="$(collab_runtime_dir "$TEAM_ID")"
-# De aanroepers (de collab-skill, cleanroom-test.sh) lezen het team-id van de
-# laatste TEAM_ID=-regel uit onze stdout. Bij een vroege exit moet die regel er
-# dus ook staan: zonder team-id kan niemand het herstelpad volgen dat we in de
-# foutmelding aanraden.
 print_team_id_trailer() {
   echo "TEAM_ID=$TEAM_ID"
 }
+
+if ! TEAM_ID=$(printf '%s' "$RESULT" | python3 -c '
+import json, sys
+result = json.load(sys.stdin)
+team_id = (result.get("team") or {}).get("id", "")
+if team_id:
+    print(team_id)
+if result.get("error") or not team_id:
+    print(result.get("error") or "Server returned no team ID", file=sys.stderr)
+    sys.exit(1)
+'); then
+  if [ -n "$TEAM_ID" ]; then print_team_id_trailer; fi
+  exit 1
+fi
+RUNTIME_DIR="$(collab_runtime_dir "$TEAM_ID")"
 
 MESSAGES_FILE="$(collab_messages_file "$TEAM_ID")"
 BRIDGE_PID_FILE="$(collab_bridge_pid "$TEAM_ID")"
@@ -319,7 +330,7 @@ fi
 # ─── Output ───
 echo ""
 # Build dynamic agent list for display
-TEAM_JSON=$(curl -sf "$API/api/ensemble/teams/$TEAM_ID" 2>/dev/null || echo "")
+TEAM_JSON=$(ensemble_curl -sf "$API/api/ensemble/teams/$TEAM_ID" 2>/dev/null || echo "")
 AGENT_NAMES=$(printf '%s' "$TEAM_JSON" \
   | python3 -c "import json,sys; t=json.load(sys.stdin); print(' + '.join(a['name'] for a in t['team']['agents']))" 2>/dev/null \
   || echo "agents")

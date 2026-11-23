@@ -3,7 +3,7 @@ import { expect, it } from 'vitest'
 
 it('documents teammate wording without the obsolete agreement-based closing rule', () => {
   const source = fs.readFileSync('services/ensemble-service.ts', 'utf8')
-  expect(source).toContain('// Scale teammate wording to the number of agents in the team.')
+  expect(source).toContain('Teammates:')
   expect(source).not.toContain('the team as soon as one other agent agrees')
 })
 

@@ -6,11 +6,14 @@
 
 import { v4 as uuidv4 } from 'uuid'
 import path from 'path'
+import fs from 'fs'
+import os from 'os'
 import { fileURLToPath } from 'url'
-import { readEnsembleConfig } from './ensemble-config'
+import { checkCodexLaunch, resolveExecutable } from './agent-preflight'
 import { getRuntime } from './agent-runtime'
+import { isShellCommand } from './startup-gates'
 import { getSelfHostId } from './hosts-config'
-import { buildAgentCommandParts, resolveAgentProgram, shellEscape } from './agent-config'
+import { buildAgentCommandParts, buildAgentEnvironment, resolveAgentProgram, shellEscape } from './agent-config'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const REPO_ROOT = path.resolve(__dirname, '..')
@@ -24,11 +27,17 @@ export interface SpawnedAgent {
   hostId: string
 }
 
+interface PreparedAgent {
+  command: string[]
+  env: Record<string, string>
+}
+
 interface SpawnAgentOptions {
   name: string
   program: string
   workingDirectory: string
   hostId?: string
+  prepared?: PreparedAgent
 }
 
 /** Compute tmux session name from agent name */
@@ -37,7 +46,7 @@ function computeSessionName(agentName: string): string {
 }
 
 /** Resolve program name to CLI command, adding runtime flags for cwd handling */
-function resolveStartCommand(program: string, cwd: string): string {
+export function resolveStartCommand(program: string, cwd: string): string[] {
   const parts = buildAgentCommandParts(program)
   const normalized = program.toLowerCase()
 
@@ -56,7 +65,18 @@ function resolveStartCommand(program: string, cwd: string): string {
     parts.push('--add-dir', REPO_ROOT)
   }
 
-  return parts.map(shellEscape).join(' ')
+  return parts
+}
+
+export async function prepareLocalAgent(program: string, cwd: string): Promise<PreparedAgent> {
+  const env = buildAgentEnvironment(program)
+  const command = resolveStartCommand(program, cwd)
+  command[0] = resolveExecutable(command[0], env.PATH, cwd)
+  if (program.toLowerCase().includes('codex')) {
+    const description = await checkCodexLaunch(command, env, cwd)
+    console.log(`[Spawner] Codex preflight passed: ${description}`)
+  }
+  return { command, env }
 }
 
 /**
@@ -69,33 +89,28 @@ export async function spawnLocalAgent(options: SpawnAgentOptions): Promise<Spawn
   const cwd = options.workingDirectory || process.cwd()
   const hostId = options.hostId || getSelfHostId()
 
-  const unsetEnv = resolveAgentProgram(options.program).unsetEnv ?? []
-
-  // Create tmux session
-  await runtime.createSession(sessionName, cwd)
-
-  // Small delay for session init
-  await new Promise(r => setTimeout(r, 300))
-
-  // Start the AI program
-  const startCommand = resolveStartCommand(options.program, cwd)
-
-  // Forward ENSEMBLE_* and agent-specific env vars to tmux session
-  const inheritedEnv = Object.entries(process.env)
-    .filter(([k]) => k.startsWith('ENSEMBLE_') || k.startsWith('NVIDIA_') || k.startsWith('OPENAI_') || k.startsWith('ANTHROPIC_'))
-    .filter(([, v]) => v)
-  // Explicit pane exports also reach shells created by an already-running tmux server.
-  const envForward = Object.entries({ ...Object.fromEntries(inheritedEnv), ...readEnsembleConfig().agentEnv })
-    // Ongeescaped ging de waarde als kale toetsaanslagen de pane in: API-sleutels
-    // stonden zo letterlijk in de tmux-scrollback van elke agent.
-    .map(([k, v]) => `export ${k}=${shellEscape(v as string)}`)
-    .join('; ')
-  const envPrefix = envForward ? `${envForward}; ` : ''
-  // Unset after exports so agentEnv cannot restore excluded credentials.
-  const unsetPrefix = unsetEnv.length ? `unset ${unsetEnv.join(' ')}; ` : ''
-
-  // Use 'nocorrect' to prevent zsh auto-correct prompt, and add leading space to avoid tmux swallowing first char
-  await runtime.sendKeys(sessionName, ` nocorrect unset CLAUDECODE; ${envPrefix}${unsetPrefix}${startCommand}`, { literal: true, enter: true })
+  const { env, command: startCommand } = options.prepared ?? await prepareLocalAgent(options.program, cwd)
+  const launchDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ensemble-launch-'))
+  const launchFile = path.join(launchDir, 'start')
+  let started = false
+  try {
+    const entries = Object.entries(env).map(([key, value]) => `export ${key}=${shellEscape(value)}`)
+    fs.writeFileSync(launchFile, [...entries, 'exec 3<&-', `exec ${startCommand.map(shellEscape).join(' ')}`, ''].join('\n'), { mode: 0o600 })
+    // Open the private file before unlinking it. The pane command line contains
+    // only the file path, and exec leaves no interactive shell after CLI exit.
+    await runtime.createSession(sessionName, cwd, [
+      '/bin/sh', '-c',
+      'exec 3< "$1" || exit 1; /bin/rm -f -- "$1"; /bin/rmdir -- "$2"; exec /usr/bin/env -i TERM="${TERM:-xterm-256color}" /bin/sh /dev/fd/3',
+      'ensemble-launch', launchFile, launchDir,
+    ])
+    started = true
+  } finally {
+    if (!started) fs.rmSync(launchDir, { recursive: true, force: true })
+    else {
+      const cleanup = setTimeout(() => fs.rmSync(launchDir, { recursive: true, force: true }), 30_000)
+      cleanup.unref()
+    }
+  }
 
   console.log(`[Spawner] Agent ${options.name} started in tmux session ${sessionName}`)
 
@@ -114,17 +129,7 @@ export async function spawnLocalAgent(options: SpawnAgentOptions): Promise<Spawn
  */
 export async function killLocalAgent(sessionName: string): Promise<void> {
   const runtime = getRuntime()
-  try {
-    // Try graceful exit first
-    await runtime.sendKeys(sessionName, 'C-c', { enter: false })
-    await new Promise(r => setTimeout(r, 500))
-    await runtime.sendKeys(sessionName, '"exit"', { enter: true })
-    await new Promise(r => setTimeout(r, 500))
-    await runtime.killSession(sessionName)
-  } catch {
-    // Session may already be gone
-    try { await runtime.killSession(sessionName) } catch { /* ok */ }
-  }
+  try { await runtime.killSession(sessionName) } catch { /* Session may already be gone. */ }
 }
 
 /**
@@ -160,8 +165,7 @@ export async function spawnRemoteAgent(
   }
 
   if (!createRes.ok) {
-    const body = await createRes.text()
-    throw new Error(`Remote agent create failed: ${createRes.status} ${body}`)
+    throw new Error(`Remote agent create failed: HTTP ${createRes.status}`)
   }
 
   const { agent } = await createRes.json()
@@ -177,8 +181,7 @@ export async function spawnRemoteAgent(
       signal: wakeCtrl.signal,
     })
     if (!wakeRes.ok) {
-      const body = await wakeRes.text()
-      throw new Error(`Remote agent wake failed: ${wakeRes.status} ${body}`)
+      throw new Error(`Remote agent wake failed: HTTP ${wakeRes.status}`)
     }
   } finally {
     clearTimeout(wakeTimer)
@@ -218,12 +221,11 @@ export async function postRemoteSessionCommand(
     const response = await fetch(`${hostUrl}/api/sessions/${encodeURIComponent(sessionName)}/command`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ command, requireIdle: false, addNewline: true }),
+      body: JSON.stringify({ command, requireIdle: true, addNewline: true }),
       signal: ctrl.signal,
     })
     if (!response.ok) {
-      const body = await response.text()
-      throw new Error(`Remote session command failed: ${response.status} ${body}`)
+      throw new Error(`Remote session command failed: HTTP ${response.status}`)
     }
   } finally {
     clearTimeout(timer)
@@ -262,7 +264,7 @@ export async function getAgentTokenUsage(sessionName: string): Promise<string> {
 /**
  * Check if a remote session exists and is ready
  */
-export async function isRemoteSessionReady(hostUrl: string, sessionName: string): Promise<boolean | undefined> {
+export async function isRemoteSessionReady(hostUrl: string, sessionName: string, readyMarker?: string): Promise<boolean | undefined> {
   const ctrl = new AbortController()
   const timer = setTimeout(() => ctrl.abort(), 5000)
   try {
@@ -275,7 +277,10 @@ export async function isRemoteSessionReady(hostUrl: string, sessionName: string)
     if (response.status === 404) return false
     if (!response.ok) return undefined
     const body = await response.json().catch(() => null)
-    return typeof body?.exists === 'boolean' ? body.exists : undefined
+    if (typeof body?.exists !== 'boolean' || !body.exists || readyMarker === undefined) return body?.exists === false ? false : body?.exists === true ? true : undefined
+    const foreground = body.foregroundCommand
+    return typeof foreground === 'string' && !!foreground && !isShellCommand(foreground) &&
+      (body.ready === true || (typeof body.output === 'string' && body.output.includes(readyMarker)))
   } catch {
     return undefined
   } finally {

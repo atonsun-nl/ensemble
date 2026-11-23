@@ -20,6 +20,10 @@ export default defineConfig({
       ENSEMBLE_PLAN_CMD: '',
       ENSEMBLE_EVENTS_CMD: '',
       ENSEMBLE_REPLACE_STALLED: '',
+      ENSEMBLE_CODEX_SMOKE_CHECK: '0',
+      ENSEMBLE_HOST: '127.0.0.1',
+      ENSEMBLE_API_TOKEN: '',
+      ENSEMBLE_TRUSTED_PROXIES: '',
       ENSEMBLE_MEMORY_URL: 'http://localhost:1/api/memory/save',
       // Never send real notifications from a test run, even when the developer's
       // shell exports these (a test disband otherwise reaches Telegram).

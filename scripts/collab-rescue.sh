@@ -32,6 +32,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SCRIPT_DIR/collab-paths.sh"
 RD="$(collab_runtime_dir "$TEAM_ID")"
 
+if [ -f "$RD/.managed-workflow" ]; then
+  echo "This team uses service-managed readiness and plan gates. Check its status and report before restarting it." >&2
+  exit 1
+fi
+
 if [ ! -d "$RD" ]; then
   echo "FOUT: team-dir bestaat niet: $RD" >&2
   exit 1
@@ -80,10 +85,18 @@ deliver_to_session() {
     return 1
   fi
 
-  if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+  if ! tmux has-session -t "=$SESSION" 2>/dev/null; then
     echo "  $AGENT_NAME: tmux sessie '$SESSION' bestaat niet" >&2
     return 1
   fi
+
+  local foreground
+  foreground=$(tmux display-message -t "$SESSION" -p '#{pane_current_command}') || return 1
+  case "$foreground" in
+    ''|sh|bash|zsh|dash|fish|ksh|tcsh|csh|nu|pwsh|powershell)
+      echo "  $AGENT_NAME: no agent CLI in the foreground" >&2
+      return 1 ;;
+  esac
 
   local BUFNAME="rescue-${AGENT_NAME}-$$"
   tmux load-buffer -b "$BUFNAME" "$PROMPT_FILE"

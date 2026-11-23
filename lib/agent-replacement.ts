@@ -7,8 +7,9 @@ import { checkAgentHealth } from './agent-health'
 import { emitEvent, runRoster } from './brain-hooks'
 import { readEnsembleConfig } from './ensemble-config'
 import { getTeam, getMessages, updateTeam, appendMessage } from './ensemble-registry'
-import { spawnLocalAgent, killLocalAgent, spawnRemoteAgent, killRemoteAgent, postRemoteSessionCommand } from './agent-spawner'
+import { spawnLocalAgent, killLocalAgent, spawnRemoteAgent, killRemoteAgent, postRemoteSessionCommand, isRemoteSessionReady } from './agent-spawner'
 import { getRuntime } from './agent-runtime'
+import { pasteAgentInput } from './agent-input'
 import { isSelf, getHostById } from './hosts-config'
 import { collabPromptFile, collabSessionsFile, ensureCollabDirs } from './collab-paths'
 import type { EnsembleTeamAgent } from '../types/ensemble'
@@ -39,8 +40,6 @@ export async function replaceTeamAgent(
     const health = roster === undefined ? await checkAgentHealth(candidates, true, config, 5000) : undefined
     const program = candidates.find(key => roster ? roster[key]?.status === 'ok' : health?.healthy ? health.healthy.includes(key) : true)
     if (!program || stopping.has(teamId) || getTeam(teamId)?.status !== 'active') return false
-    // Reserve the budget before spawning, including unsuccessful attempts.
-    updateTeam(teamId, { replacementCount: (team.replacementCount ?? 0) + 1 })
     const replacement: EnsembleTeamAgent = {
       ...old, agentId: '', name: `${program}-${team.agents.length + 1}`, program, status: 'spawning',
     }
@@ -48,55 +47,123 @@ export async function replaceTeamAgent(
     const local = !old.hostId || isSelf(old.hostId)
     const host = local ? undefined : getHostById(old.hostId)
     if (!local && !host) return false
+    // Persist the attempt before touching the old session. On restart the
+    // service can remove a partially started replacement before trying again.
+    const pending = { oldAgent: old.name, sessionName: session, hostId: old.hostId }
+    updateTeam(teamId, { replacementCount: (team.replacementCount ?? 0) + 1, pendingReplacement: team.workflow ? pending : undefined })
     const cwd = old.worktreePath || (local ? team.worktreePath : undefined) || team.workingDirectory || process.cwd()
+    const previousSession = old.sessionName || `${team.name}-${old.name}`
     const recent = getMessages(teamId).slice(-20).map(m => `${m.from}: ${m.content}`).join('\n')
     const context = Buffer.from(recent).subarray(-8000).toString('utf8')
     const scripts = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../scripts')
+    const workflow = team.workflow
+    const managedContext = workflow && {
+      state: workflow.state, plan: workflow.plan,
+      taskOwners: Object.fromEntries(Object.entries(workflow.taskOwners).map(([key, owner]) => [key, owner === old.name ? replacement.name : owner])),
+      fileOwners: Object.fromEntries(Object.entries(workflow.fileOwners).map(([key, owner]) => [key, owner === old.name ? replacement.name : owner])),
+      decisions: workflow.decisions, approvedChanges: workflow.approvedChanges, blockers: workflow.blockers,
+      acceptance: workflow.acceptance?.passed ? 'previous acceptance invalidated by replacement' : 'pending',
+      checks: config.acceptanceChecks ?? [], priorSubmission: workflow.submitted[old.name],
+    }
     const prompt = [
       config.taskPreamble || '',
       `You replace failed teammate ${old.name}. Your name is ${replacement.name}, role: ${old.role}.`,
       `Team ID: ${teamId}. Original task: ${team.description}`,
       `Use ${shellEscape(path.join(scripts, "team-say.sh"))} ${teamId} ${replacement.name} team "message" to share progress and ${shellEscape(path.join(scripts, "team-read.sh"))} ${teamId} ${replacement.name} to read the feed.`,
       'You share the working directory with teammates. Preserve their changes and coordinate ownership.',
-      'When finished, send <<COLLAB_DONE>> via team-say. Respond to new questions before sending it again.',
+      managedContext
+        ? 'Preserve the existing uncommitted diff. Use team-say with one quoted <<COLLAB_EVENT>> JSON message. For a worker, submit once per revision with {"action":"submit","report":"..."}. For a replacement Lead, publish an updated plan with {"action":"plan","plan":"..."} and wait for acknowledgement before implementation. Review assignments, submit, request accept, then close with a final report.'
+        : 'When finished, report your results and send <<COLLAB_DONE>> once.',
+      ...(managedContext ? [`Managed workflow context: ${JSON.stringify(managedContext)}`] : []),
       `Recent team messages (context from the previous run):\n${context}`,
     ].join('\n')
     ensureCollabDirs(teamId)
     const promptFile = collabPromptFile(teamId, replacement.name)
     fs.writeFileSync(promptFile, prompt)
-    if (host) await killRemoteAgent(host.url, old.agentId)
-    else await killLocalAgent(`${team.name}-${old.name}`)
+    if (host) {
+      await killRemoteAgent(host.url, old.agentId)
+      if (workflow && await isRemoteSessionReady(host.url, previousSession) !== false) throw new Error('Previous remote session could not be confirmed stopped')
+    } else {
+      await killLocalAgent(previousSession)
+      if (workflow && await getRuntime().sessionExists(previousSession)) throw new Error('Previous session is still running')
+    }
     if (!host) cleanup = () => killLocalAgent(session!)
     const spawned = host
-      ? await spawnRemoteAgent(host.url, session, program, cwd, team.description, team.name)
+      ? await spawnRemoteAgent(host.url, session, program, cwd, workflow ? undefined : team.description, team.name)
       : await spawnLocalAgent({ name: session, program, workingDirectory: cwd, hostId: old.hostId })
     if (host) cleanup = () => killRemoteAgent(host.url, spawned.id)
+    if (workflow) updateTeam(teamId, { pendingReplacement: { ...pending, agentId: spawned.id } })
     fs.appendFileSync(collabSessionsFile(teamId), `${session}\n`)
     if (!await waitForReady(session, program, old.hostId, 45_000)) throw new Error('Replacement did not become ready')
     if (stopping.has(teamId) || getTeam(teamId)?.status !== 'active') throw new Error('Team stopped during replacement')
     const runtime = getRuntime()
     if (host) await postRemoteSessionCommand(host.url, session, prompt)
-    else if (resolveAgentProgram(program).inputMethod === 'pasteFromFile') await runtime.pasteFromFile(session, promptFile)
-    else await runtime.sendKeys(session, prompt, { literal: true, enter: true, agentInput: true })
+    else if (resolveAgentProgram(program).inputMethod === 'pasteFromFile') {
+      await pasteAgentInput(runtime, session, promptFile, prompt, resolveAgentProgram(program).pasteEnterCount)
+    } else await runtime.sendKeys(session, prompt.replace(/[\r\n]+/g, ' '), { literal: true, enter: true, agentInput: true })
     const current = getTeam(teamId)
     if (stopping.has(teamId) || !current || current.status !== 'active') throw new Error('Team stopped during replacement')
     replacement.agentId = spawned.id
+    replacement.sessionName = 'sessionName' in spawned ? String(spawned.sessionName) : session
+    replacement.startup = 'prompt_delivered'
     replacement.status = 'active'
     replacement.startedAt = new Date().toISOString()
     current.agents = current.agents.map(a => a.name === old.name ? { ...a, status: 'replaced' as const } : a)
     current.agents.push(replacement)
-    updateTeam(teamId, { agents: current.agents })
+    if (current.workflow && managedContext) {
+      current.workflow.fileOwners = managedContext.fileOwners
+      current.workflow.taskOwners = managedContext.taskOwners
+      delete current.workflow.submitted[old.name]
+      if (current.workflow.blockers[old.name]) {
+        current.workflow.blockers[replacement.name] = current.workflow.blockers[old.name]
+        delete current.workflow.blockers[old.name]
+      }
+      current.workflow.acceptance = undefined
+      if (current.workflow.lead === old.name) {
+        current.workflow.lead = replacement.name
+        current.workflow.state = 'WAITING_PLAN'
+        current.workflow.plan = undefined
+        current.workflow.startupDeadline = new Date(Date.now() + 120_000).toISOString()
+      } else if (!Object.keys(current.workflow.blockers).length) current.workflow.state = 'WORKING'
+    }
+    updateTeam(teamId, { agents: current.agents, workflow: current.workflow, pendingReplacement: undefined })
     const ts = new Date().toISOString()
-    appendMessage(teamId, { id: uuidv4(), teamId, from: 'ensemble', to: 'team', type: 'chat', timestamp: ts, content: `Replaced ${old.name} with ${replacement.name} (${old.role}): ${detail}` })
+    appendMessage(teamId, { id: uuidv4(), teamId, from: 'ensemble', to: 'team', type: 'chat', timestamp: ts, content: `Replaced ${old.name} with ${replacement.name} (${old.role}): ${detail}. Acceptance: ${managedContext?.acceptance ?? 'pending'}` })
     void emitEvent({ event: 'agent_replaced', teamId, team: team.name, ts, agent: old.name, replacement: replacement.name, detail })
     void emitEvent({ event: 'agent_ready', teamId, team: team.name, ts, agent: replacement.name })
     cleanup = undefined
     return true
   } catch (error) {
+    appendMessage(teamId, { id: uuidv4(), teamId, from: 'ensemble', to: 'team', type: 'chat', timestamp: new Date().toISOString(),
+      content: `Replacement for ${agentName} failed: ${error instanceof Error ? error.message : 'startup failure'}` })
     console.warn(`[Ensemble] Replacement failed for ${agentName}: ${error instanceof Error ? error.message : String(error)}`)
     return false
   } finally {
-    try { await cleanup?.() } catch { /* Session may already be gone. */ }
-    replacing.delete(teamId)
+    try { await cleanup?.() } catch { /* Reconciliation will retry if the candidate remains. */ }
+    try {
+      const pending = getTeam(teamId)?.pendingReplacement
+      if (session && pending?.sessionName === session && await recoverPendingReplacement(teamId, pending)) {
+        updateTeam(teamId, { pendingReplacement: undefined })
+      }
+    } finally { replacing.delete(teamId) }
   }
+}
+
+
+export async function recoverPendingReplacement(
+  teamId: string,
+  pending: NonNullable<import('../types/ensemble').EnsembleTeam['pendingReplacement']>,
+): Promise<boolean> {
+  if (pending.hostId && !isSelf(pending.hostId)) {
+    const host = getHostById(pending.hostId)
+    if (!host) return false
+    if (pending.agentId) await killRemoteAgent(host.url, pending.agentId)
+    if (await isRemoteSessionReady(host.url, pending.sessionName) !== false) return false
+  } else {
+    await killLocalAgent(pending.sessionName)
+    if (await getRuntime().sessionExists(pending.sessionName)) return false
+  }
+  appendMessage(teamId, { id: uuidv4(), teamId, from: 'ensemble', to: 'team', type: 'chat', timestamp: new Date().toISOString(),
+    content: `Cleared interrupted replacement for ${pending.oldAgent} (${pending.sessionName})` })
+  return true
 }

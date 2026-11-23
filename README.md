@@ -228,17 +228,23 @@ timeout warns and continues with the existing checks. Explicitly selected `down`
 pair and agents selected through `COLLAB_AGENTS`, preflight replaces unavailable agents in `fallbackOrder`, without duplicates;
 no healthy replacement also exits `7`. `slow` and `unknown` only warn.
 
-`maxTeamMinutes` must be positive. At the limit the service asks all agents for a
-final conclusion and the exact `<<COLLAB_DONE>>` sentinel within two minutes.
-It stops the team after `graceMinutes` (nonnegative, measured from the warning),
-preserving the summary and time-limit reason. `taskPreamble` is inserted before
-each team's task in agent startup prompts, including solo and staged teams.
+New teams wait for an acknowledged Lead plan before workers receive their
+tasks. Agents exchange updates through the durable feed and check it at safe
+points. The Lead submits the final report after the acceptance gate passes.
+See [managed teams](docs/configuration.md#managed-teams) for the workflow and
+acceptance settings.
+
+Set `maxTeamMinutes` for a runtime limit or `maxIdleMinutes` for a feed and
+heartbeat inactivity limit. The service records a warning before stopping a team
+after `graceMinutes`, preserving its report and worktree. Both limits are off
+by default. `taskPreamble` appears before the task in each startup prompt.
 
 Copy `.env.example` to `.env` and adjust as needed. Key server variables:
 
 | Variable | Default | Description |
 |---|---|---|
 | `ENSEMBLE_PORT` | `23000` | Server port |
+| `ENSEMBLE_HOST` | `127.0.0.1` | Set `ENSEMBLE_ALLOW_EXTERNAL=1` and `ENSEMBLE_API_TOKEN` for an external bind |
 | `ENSEMBLE_URL` | `http://localhost:23000` | CLI target URL |
 | `ENSEMBLE_DATA_DIR` | `~/.ensemble` | Data directory |
 | `ENSEMBLE_CORS_ORIGIN` | localhost only | Allowed CORS origins |

@@ -15,7 +15,7 @@ it('loads agy with its startup and input configuration while retaining gemini', 
   vi.stubEnv('ENSEMBLE_AGENTS_CONFIG', path.resolve('agents.json'))
   const config = loadAgentsConfig()
   expect(config.agy).toEqual({
-    name: 'agy', command: 'agy', flags: ['--dangerously-skip-permissions'],
+    name: 'agy', command: 'agy', flags: ['--dangerously-skip-permissions', '--model', 'gemini-3.8-flash-high', '--effort', 'high'],
     readyMarker: '? for shortcuts', inputMethod: 'sendKeys', color: 'red', icon: '▲',
     unsetEnv: ['GEMINI_API_KEY', 'GOOGLE_API_KEY'],
   })

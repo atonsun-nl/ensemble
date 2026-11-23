@@ -22,7 +22,10 @@ beforeEach(() => {
     const executable = execFileSync('/bin/bash', ['-c', `command -v ${tool}`], { encoding: 'utf8' }).trim()
     fs.symlinkSync(executable, path.join(bin, tool))
   }
-  stub('node', 'printf "%s" "${NODE_NO_WARNINGS:-}" > "$TEST_ROOT/node-warnings"; printf "%s\\n" "$HEALTH_SELECTION"')
+  stub('node', `case "$*" in
+    *codex-preflight.ts*) if [ "$CODEX_PROBE" != 7392 ]; then exit 1; fi; echo 'mock Codex';;
+    *) printf '%s' "${'${NODE_NO_WARNINGS:-}'}" > "$TEST_ROOT/node-warnings"; printf '%s\n' "$HEALTH_SELECTION";;
+  esac`)
   stub('curl', 'echo \'{"credentialStore":"readable","uptimeSeconds":1}\'')
   const python = execFileSync('/bin/bash', ['-c', 'command -v python3'], { encoding: 'utf8' }).trim()
   stub('python3', `case "$*" in *credentialStore*) echo readable ;; *uptimeSeconds*) echo 1 ;; *) if [ "$1" != - ]; then exec '${python}' "$@"; fi ;; esac`)
@@ -73,7 +76,7 @@ it('sets NODE_NO_WARNINGS for the configured health helper', () => {
   expect(result.status, result.output).toBe(0)
   expect(fs.readFileSync(path.join(root, 'node-warnings'), 'utf8')).toBe('1')
 })
-it.each([undefined, '', '   ', null])('does not start Node without a usable configured healthCommand: %j', command => {
+it.each([undefined, '', '   ', null])('does not run the health helper without a usable configured healthCommand: %j', command => {
   if (command !== undefined) fs.writeFileSync(path.join(root, 'config.json'), JSON.stringify({ healthCommand: command }))
   const result = run({ ENSEMBLE_HEALTH_CMD: '  ' })
   expect(result.status, result.output).toBe(0)
@@ -86,11 +89,11 @@ it('warns clearly when a config exists but python3 is unavailable', () => {
   const result = run({ ENSEMBLE_HEALTH_CMD: ' ' })
   expect(result.output.match(/python3.*config|config.*python3/gi)).toHaveLength(1)
 })
-it('warns and continues with the normal probes when Node exists but tsx is missing', () => {
+it('fails selected Codex preflight when the required tsx loader is missing', () => {
   fs.rmSync(path.join(root, 'node_modules'), { recursive: true })
   const result = run()
-  expect(result.status, result.output).toBe(0)
+  expect(result.status, result.output).toBe(4)
   expect(result.output).toContain('tsx is unavailable')
-  expect(result.output).toContain('Codex works')
+  expect(result.output).toContain('installed tsx loader')
   expect(fs.existsSync(path.join(root, 'node-warnings'))).toBe(false)
 })

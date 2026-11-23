@@ -24,11 +24,10 @@ it('persists a crashed agent and disbands when the surviving agent sends its sen
   vi.resetModules()
   const now = Date.now()
   vi.doMock('../lib/agent-runtime', () => ({ getRuntime: () => ({
-    pasteFromFile: async (session: string) => {
-      if (session.endsWith('codex-1')) throw Object.assign(new Error('Agent stopped'), { name: 'AgentNotRunningError' })
-    },
+    sessionExists: async (session: string) => !session.endsWith('codex-1'),
   }) }))
   vi.doMock('../lib/agent-spawner', () => ({
+      prepareLocalAgent: vi.fn(async () => undefined),
     spawnLocalAgent: vi.fn(), spawnRemoteAgent: vi.fn(), killLocalAgent: async () => {}, killRemoteAgent: async () => {},
     postRemoteSessionCommand: vi.fn(), isRemoteSessionReady: vi.fn(), getAgentTokenUsage: async () => 'unknown',
   }))

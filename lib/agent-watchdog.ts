@@ -1,7 +1,7 @@
-import fs from 'fs'
-import path from 'path'
 import { v4 as uuidv4 } from 'uuid'
 import { isShellCommand, type AgentRuntime } from './agent-runtime'
+import { pasteAgentInput } from './agent-input'
+import type { AgentProgram } from '../types/agent-program'
 import type { EnsembleMessage, EnsembleTeam, EnsembleTeamAgent } from '../types/ensemble'
 
 const DEFAULT_POLL_INTERVAL_MS = 30_000
@@ -47,6 +47,7 @@ interface AgentWatchdogState {
 }
 
 interface AgentWatchdogDeps {
+  passive?: boolean
   replacementEnabled?: () => boolean
   sessionExists?: (name: string, hostId?: string) => Promise<boolean | undefined>
   replaceAgent?: (team: EnsembleTeam, agent: EnsembleTeamAgent, detail: string) => Promise<boolean>
@@ -56,7 +57,7 @@ interface AgentWatchdogDeps {
   getMessages: (teamId: string) => EnsembleMessage[]
   appendMessage: (teamId: string, message: EnsembleMessage) => void
   getRuntime: () => Pick<AgentRuntime, 'sendKeys' | 'pasteFromFile' | 'getForegroundCommand'>
-  resolveAgentProgram: (program: string) => { inputMethod: 'pasteFromFile' | 'sendKeys' }
+  resolveAgentProgram: (program: string) => Pick<AgentProgram, 'inputMethod' | 'pasteEnterCount'>
   isSelf: (hostId?: string) => boolean
   getHostById: (hostId: string) => { url: string } | undefined
   postRemoteSessionCommand: (url: string, sessionName: string, text: string) => Promise<void>
@@ -150,6 +151,7 @@ export class AgentWatchdog {
   }
 
   private async pollTeam(team: EnsembleTeam): Promise<void> {
+    if (team.workflow) return
     const messages = this.deps.getMessages(team.id)
     const activeAgents = team.agents.filter(candidate => candidate.status === 'active')
     const activeAgentNames = new Set(activeAgents.map(agent => agent.name))
@@ -177,7 +179,7 @@ export class AgentWatchdog {
       }
       const lastMessageAt = lastAgentMessage?.timestamp || agent.startedAt || team.createdAt
       const previousState = this.state.get(stateKey)
-      if (this.deps.replacementEnabled?.() && this.deps.sessionExists) {
+      if ((this.deps.passive || this.deps.replacementEnabled?.()) && this.deps.sessionExists) {
         const sessionName = `${team.name}-${agent.name}`
         const remote = Boolean(agent.hostId && !this.deps.isSelf(agent.hostId))
         let exists: boolean | undefined
@@ -201,6 +203,7 @@ export class AgentWatchdog {
         }
       }
 
+      if (this.deps.passive) continue
       if (!previousState) {
         this.state.set(stateKey, { lastMessageAt })
       } else if (previousState.lastMessageAt !== lastMessageAt) {
@@ -363,7 +366,7 @@ export class AgentWatchdog {
     }
   }
 
-  private async nudgeAgent(team: EnsembleTeam, agentName: string, _program: string, hostId?: string): Promise<void> {
+  private async nudgeAgent(team: EnsembleTeam, agentName: string, program: string, hostId?: string): Promise<void> {
     const timestamp = new Date(this.now()).toISOString()
     this.deps.appendMessage(team.id, {
       id: uuidv4(),
@@ -387,9 +390,7 @@ export class AgentWatchdog {
     // Always use pasteFromFile to avoid shell escaping issues with sendKeys
     const runtime = this.deps.getRuntime()
     const filePath = this.deps.collabDeliveryFile(team.id, sessionName)
-    fs.mkdirSync(path.dirname(filePath), { recursive: true })
-    fs.writeFileSync(filePath, WATCHDOG_NUDGE_TEXT)
-    await runtime.pasteFromFile(sessionName, filePath)
+    await pasteAgentInput(runtime, sessionName, filePath, WATCHDOG_NUDGE_TEXT, this.deps.resolveAgentProgram(program).pasteEnterCount)
   }
 }
 

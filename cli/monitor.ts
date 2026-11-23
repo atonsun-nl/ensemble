@@ -10,6 +10,7 @@
  */
 
 import http from 'http'
+import https from 'https'
 import readline from 'readline'
 import fs from 'fs'
 import { spawnSync } from 'child_process'
@@ -105,10 +106,15 @@ function getAgentStyle(name: string): AgentStyle {
 
 const API_BASE = process.env.ENSEMBLE_URL || 'http://localhost:23000'
 
+const authHeaders: Record<string, string> = process.env.ENSEMBLE_API_TOKEN
+  ? { Authorization: `Bearer ${process.env.ENSEMBLE_API_TOKEN}` }
+  : {}
+
 function apiGet<T>(path: string): Promise<T> {
   return new Promise((resolve, reject) => {
     const url = new URL(path, API_BASE)
-    http.get(url.toString(), { timeout: 5000 }, (res) => {
+    const client = url.protocol === 'https:' ? https : http
+    client.get(url, { timeout: 5000, headers: authHeaders }, (res) => {
       let data = ''
       res.on('data', chunk => data += chunk)
       res.on('end', () => {
@@ -123,9 +129,10 @@ function apiPost<T>(path: string, body: unknown): Promise<T> {
   return new Promise((resolve, reject) => {
     const url = new URL(path, API_BASE)
     const payload = JSON.stringify(body)
-    const req = http.request(url.toString(), {
+    const client = url.protocol === 'https:' ? https : http
+    const req = client.request(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
+      headers: { ...authHeaders, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
       timeout: 5000,
     }, (res) => {
       let data = ''

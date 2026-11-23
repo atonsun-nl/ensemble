@@ -190,8 +190,7 @@ export function getMessages(teamId: string, since?: string): EnsembleMessage[] {
     collabMessagesFile(teamId),
   ]
 
-  const seenIds = new Set<string>()
-  let messages: EnsembleMessage[] = []
+  const byId = new Map<string, EnsembleMessage>()
 
   for (const file of sources) {
     if (!fs.existsSync(file)) continue
@@ -209,13 +208,14 @@ export function getMessages(teamId: string, since?: string): EnsembleMessage[] {
         continue
       }
       const dedupeKey = msg.id || `${msg.from}:${msg.timestamp}:${msg.content?.slice(0, 50)}`
-      if (!seenIds.has(dedupeKey)) {
-        seenIds.add(dedupeKey)
-        messages.push(msg)
-      }
+      // The registry may append a newer delivery snapshot for an existing id.
+      // Prefer it over the local bridge source, which has no delivery metadata.
+      const previous = byId.get(dedupeKey)
+      if (!previous || (previous.delivery && msg.delivery)) byId.set(dedupeKey, msg)
     }
   }
 
+  let messages = [...byId.values()]
   // Sort by timestamp (messages without timestamp go to the end)
   messages.sort((a, b) => {
     const ta = a.timestamp ? new Date(a.timestamp).getTime() : Infinity

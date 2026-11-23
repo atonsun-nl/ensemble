@@ -17,7 +17,7 @@ const REGELS = fs.readFileSync(PAD, 'utf8').split('\n')
 describe('team-id trailer', () => {
   it('elke uitgang na het aanmaken van het team drukt het team-id af', () => {
     // Exits vóór de POST tellen niet: daar bestaat het team nog niet.
-    const teamOntstaat = REGELS.findIndex(r => /^TEAM_ID=\$\(echo "\$RESULT"/.test(r))
+    const teamOntstaat = REGELS.findIndex(r => /^(?:if ! )?TEAM_ID=\$\(/.test(r))
     expect(teamOntstaat, 'regel waar TEAM_ID ontstaat niet gevonden').toBeGreaterThan(-1)
 
     const zonderTrailer: string[] = []

@@ -10,8 +10,7 @@ import { resolveAgentProgram } from './agent-config'
 import { collabDeliveryFile } from './collab-paths'
 import { isSelf, getHostById } from './hosts-config'
 import { postRemoteSessionCommand } from './agent-spawner'
-import fs from 'fs'
-import path from 'path'
+import { pasteAgentInput } from './agent-input'
 
 const DEFAULT_PLAN_TIMEOUT_MS = 120_000
 const DEFAULT_EXEC_TIMEOUT_MS = 300_000
@@ -196,9 +195,7 @@ export class StagedWorkflowManager {
       const agentCfg = resolveAgentProgram(agent.program)
       if (agentCfg.inputMethod === 'pasteFromFile') {
         const tmpFile = collabDeliveryFile(this.options.team.id, sessionName)
-        fs.mkdirSync(path.dirname(tmpFile), { recursive: true })
-        fs.writeFileSync(tmpFile, text)
-        await runtime.pasteFromFile(sessionName, tmpFile)
+        await pasteAgentInput(runtime, sessionName, tmpFile, text, agentCfg.pasteEnterCount)
         return
       }
 

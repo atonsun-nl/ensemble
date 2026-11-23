@@ -157,3 +157,16 @@ stop_team_processes() {
     rm -f "$rd/$naam.pid"
   done
 }
+
+
+# Pass authorization on a config descriptor so the bearer stays out of argv.
+ensemble_curl() {
+  if [ -n "${ENSEMBLE_API_TOKEN:-}" ]; then
+    local token
+    token=${ENSEMBLE_API_TOKEN//\\/\\\\}
+    token=${token//\"/\\\"}
+    printf 'header = "Authorization: Bearer %s"\n' "$token" | curl --config - "$@"
+  else
+    curl "$@"
+  fi
+}

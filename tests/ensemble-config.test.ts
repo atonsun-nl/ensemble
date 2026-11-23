@@ -1,11 +1,15 @@
 import fs from 'fs'
 import path from 'path'
-import { afterAll, afterEach, expect, it, vi } from 'vitest'
+import { beforeEach, afterEach, expect, it, vi } from 'vitest'
 import { readEnsembleConfig } from '../lib/ensemble-config'
 
-const root = fs.mkdtempSync(path.resolve('tmp/config-'))
-afterAll(() => fs.rmSync(root, { recursive: true, force: true }))
-afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); fs.rmSync(path.join(root, 'config.json'), { force: true }) })
+let root: string
+beforeEach(() => { root = fs.mkdtempSync(path.resolve('tmp/config-')) })
+afterEach(() => {
+  vi.unstubAllEnvs()
+  vi.restoreAllMocks()
+  fs.rmSync(root, { recursive: true, force: true })
+})
 function config(value: unknown) {
   const file = path.join(root, 'config.json')
   fs.writeFileSync(file, JSON.stringify(value))
@@ -47,8 +51,8 @@ it('warns only once while invalid config mtime is unchanged', () => {
   warn.mockRestore()
 })
 it('warns again after an invalid config mtime changes', () => {
-  config({})
-  const file = path.join(root, 'config.json')
+  const file = path.join(root, 'changed-config.json')
+  vi.stubEnv('ENSEMBLE_CONFIG', file)
   fs.writeFileSync(file, '{')
   const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
   readEnsembleConfig()
@@ -118,7 +122,7 @@ it('ignores invalid agentEnv entries with one names-only warning across repeated
   expect(warning).toContain('LF')
   expect(warning).not.toMatch(/secret|42|\n|\r/)
 })
-it.each([null, [], 'secret-string', 42])('ignores non-object agentEnv %j with one warning', agentEnv => {
+it.each([[null], [[]], ['secret-string'], [42]])('ignores non-object agentEnv %j with one warning', agentEnv => {
   config({ agentEnv })
   const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
   expect(readEnsembleConfig().agentEnv).toBeUndefined()

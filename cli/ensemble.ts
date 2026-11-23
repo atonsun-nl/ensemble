@@ -11,6 +11,8 @@
  */
 
 import http from 'http'
+import https from 'https'
+import type { EnsembleMessage, EnsembleTeam } from '../types/ensemble'
 import fs from 'fs'
 import { execFileSync, spawn } from 'child_process'
 import { fileURLToPath } from 'url'
@@ -39,9 +41,15 @@ const c = {
   bgBlue: '\x1b[44m', bgGreen: '\x1b[42m',
 }
 
+const authHeaders: Record<string, string> = process.env.ENSEMBLE_API_TOKEN
+  ? { Authorization: `Bearer ${process.env.ENSEMBLE_API_TOKEN}` }
+  : {}
+
 function apiGet<T>(urlPath: string): Promise<T> {
   return new Promise((resolve, reject) => {
-    http.get(`${API_BASE}${urlPath}`, { timeout: 3000 }, res => {
+    const url = new URL(urlPath, API_BASE)
+    const client = url.protocol === 'https:' ? https : http
+    client.get(url, { timeout: 3000, headers: authHeaders }, res => {
       let d = ''
       res.on('data', chunk => d += chunk)
       res.on('end', () => { try { resolve(JSON.parse(d)) } catch(e) { reject(e) } })
@@ -52,9 +60,11 @@ function apiGet<T>(urlPath: string): Promise<T> {
 function apiPost(urlPath: string, body: unknown): Promise<unknown> {
   return new Promise((resolve, reject) => {
     const payload = JSON.stringify(body)
-    const req = http.request(`${API_BASE}${urlPath}`, {
+    const url = new URL(urlPath, API_BASE)
+    const client = url.protocol === 'https:' ? https : http
+    const req = client.request(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Content-Length': String(Buffer.byteLength(payload)) },
+      headers: { ...authHeaders, 'Content-Type': 'application/json', 'Content-Length': String(Buffer.byteLength(payload)) },
       timeout: 5000,
     }, res => {
       let d = ''
@@ -191,53 +201,40 @@ async function cmdRun(task: string, agentFlags: string | undefined, timeoutSec: 
     agents,
     feedMode: 'live',
     workingDirectory: cwd,
-  }) as { team: { id: string } }
+  }) as { team?: EnsembleTeam; error?: string }
 
+  if (result.error || !result.team) {
+    console.error(`Team startup failed: ${result.error ?? 'no team returned'}${result.team ? ` (${result.team.id})` : ''}`)
+    process.exit(1)
+  }
   const teamId = result.team.id
-  const messagesFile = `/tmp/ensemble/${teamId}/messages.jsonl`
 
   console.log(`\n  ${c.bold}${c.bWhite}◈ ensemble run${c.r}`)
   console.log(`  ${c.dim}${task.slice(0, 100)}${c.r}`)
   console.log(`  ${c.bGreen}●${c.r} Team ${c.dim}${teamId.slice(0, 8)}${c.r} created with ${agentNames.join(' + ')}`)
   console.log(`  ${c.dim}Timeout: ${timeoutSec}s${c.r}\n`)
 
-  // 4. Tail messages until completion or timeout
+  // The service records completion only after its workflow and acceptance checks.
   const deadline = Date.now() + timeoutSec * 1000
-  let lastLine = 0
-  const donePatterns = [/\bdone\b/i, /\bcomplete(?:d)?\b/i, /\bfinished\b/i, /\bafgerond\b/i]
-
+  const seen = new Set<string>()
   while (Date.now() < deadline) {
-    await new Promise(r => setTimeout(r, 3000))
-
-    if (!fs.existsSync(messagesFile)) continue
-    const lines = fs.readFileSync(messagesFile, 'utf-8').trim().split('\n').filter(Boolean)
-    if (lines.length <= lastLine) continue
-
-    for (let i = lastLine; i < lines.length; i++) {
-      try {
-        const msg = JSON.parse(lines[i])
-        const from = msg.from || '?'
-        const content = (msg.content || '').slice(0, 200)
-        console.log(`  ${c.cyan}${from}${c.r}: ${content}`)
-      } catch { /* skip */ }
+    await new Promise(resolve => setTimeout(resolve, Math.min(3000, Math.max(0, deadline - Date.now()))))
+    let current: { team: EnsembleTeam; messages: EnsembleMessage[] }
+    try { current = await apiGet(`/api/ensemble/teams/${teamId}`) }
+    catch { continue }
+    if (!current.team) continue
+    for (const message of current.messages ?? []) {
+      if (seen.has(message.id)) continue
+      seen.add(message.id)
+      console.log(`  ${c.cyan}${message.from}${c.r}: ${message.content.slice(0, 200)}`)
     }
-    lastLine = lines.length
-
-    // Check team status
-    try {
-      const team = await apiGet<{ team: { status: string } }>(`/api/ensemble/teams/${teamId}`)
-      if (team.team.status === 'disbanded') {
-        console.log(`\n  ${c.bGreen}✓${c.r} Team finished (disbanded)`)
-        process.exit(0)
-      }
-    } catch { /* ignore */ }
-
-    // Check last few messages for done signals
-    const recentContent = lines.slice(-3).map(l => {
-      try { return JSON.parse(l).content || '' } catch { return '' }
-    }).join(' ')
-    if (donePatterns.some(p => p.test(recentContent))) {
-      console.log(`\n  ${c.bGreen}✓${c.r} Task appears complete`)
+    if (current.team.status === 'failed' || (current.team.status === 'disbanded' &&
+        (current.team.failureReason || current.team.workflow && current.team.workflow.state !== 'DONE'))) {
+      console.error(`Team stopped: ${current.team.failureReason ?? 'acceptance did not finish'}`)
+      process.exit(1)
+    }
+    if (current.team.status === 'disbanded') {
+      console.log(`\n  ${c.bGreen}✓${c.r} Team finished`)
       process.exit(0)
     }
   }

@@ -7,7 +7,16 @@ nav_order: 4
 
 Base URL: `http://127.0.0.1:23000` (configurable via `ENSEMBLE_PORT`)
 
-Rate limit: 100 requests per 60 seconds per IP.
+The server defaults to loopback. For an external bind, set `ENSEMBLE_ALLOW_EXTERNAL=1`
+and an `ENSEMBLE_API_TOKEN` of at least 32 characters. Clients send the token
+in the `Authorization: Bearer …` header. When configured, the token is required
+for team mutations and reads from external peers. Configure
+`ENSEMBLE_TRUSTED_PROXIES` with the exact IP addresses of proxies that append
+the connecting peer to `X-Forwarded-For`. The server ignores that header from
+other peers. Use HTTPS at the reverse proxy for network access.
+
+Rate limit: 100 requests per 60 seconds per IP. Health and team detail/feed
+polling are exempt.
 
 ---
 
@@ -34,7 +43,7 @@ curl -X POST http://localhost:23000/api/ensemble/teams \
   -H "Content-Type: application/json" \
   -d '{
     "name": "review-team",
-    "description": "Review the auth module for security issues",
+    "description": "Review the documentation for consistency",
     "agents": [
       { "program": "codex", "role": "lead", "hostId": "local" },
       { "program": "claude", "role": "worker", "hostId": "local" }
@@ -52,9 +61,8 @@ curl -X POST http://localhost:23000/api/ensemble/teams \
 - `description` (string) — task for the team
 - `agents` (array) — at least one agent with a `program` field. Valid values are the keys in
   [`agents.json`](configuration#agent-programs-agentsjson): `codex`, `claude`, `grok`, `agy`, `gemini`,
-  `glm`, `opencode`, `mimo`, plus any you add yourself. Note that an unrecognised value is **not**
-  rejected: the resolver falls back to `claude`, so a typo silently gives you an extra Claude
-  agent rather than an error. The first agent in the array is normally given the `lead` role.
+  `glm`, `opencode`, `mimo`, plus any you add yourself. Unknown programs return `400`.
+  Use `role: "lead"` to select a Lead. The first agent is the default.
 
 **Optional fields:**
 - `workingDirectory` (string) — project path for agents
@@ -62,11 +70,16 @@ curl -X POST http://localhost:23000/api/ensemble/teams \
 - `useWorktrees` (boolean) — isolate agents in git worktrees
 - `templateName` (string) — use a collab template (`review`, `implement`, `debug`)
 - `staged` (boolean) — enable staged plan/execute/verify workflow
-- `stagedConfig` (object) — phase timeouts and settings
+- `stagedConfig` (object) — `planTimeoutMs`, `execTimeoutMs`, `verifyTimeoutMs`
+- `requireLeadReady` (boolean) — hold worker prompts until the Lead publishes a plan. Enabled by default for multi-agent teams.
 
 **Response:** `{ "team": EnsembleTeam }`
 
-Returns `400` for malformed JSON, `429` for rate limit exceeded.
+Returns `400` for invalid requests, `409` for an unfinished team with the same
+name, `429` for rate limiting, and `503` for failed local preflight or Lead
+startup. A failed startup includes the registered team when available.
+Each agent's `startup` field records session creation, CLI readiness and
+prompt delivery. The workflow record stores the acknowledged plan and its current state.
 
 ---
 
@@ -126,6 +139,12 @@ Stops all agents, generates summary, cleans up. Also available as `POST /api/ens
 ---
 
 ## Feed
+
+A caller can supply a stable message `id` to retry a request. A reused ID with
+different sender, recipient or content returns `409`. For managed teams, a
+successful POST queues a message for the recipients to read. Each delivery
+records its state and timestamp. Set `priority: "urgent"` to label an urgent
+message in the inbox. It stays in FIFO order.
 
 ### `GET /api/ensemble/teams/:id/feed` — Message feed
 

@@ -9,6 +9,7 @@
  */
 
 import { exec, execFile, execFileSync as nodeExecFileSync } from 'child_process'
+import { randomUUID } from 'crypto'
 import { promisify } from 'util'
 
 import { isShellCommand } from './startup-gates'
@@ -40,13 +41,13 @@ export interface AgentRuntime {
   cancelCopyMode(name: string): Promise<void>
 
   // Lifecycle
-  createSession(name: string, cwd: string): Promise<void>
+  createSession(name: string, cwd: string, command?: string[]): Promise<void>
   killSession(name: string): Promise<void>
   renameSession(oldName: string, newName: string): Promise<void>
 
   // I/O
   sendKeys(name: string, keys: string, opts?: { literal?: boolean; enter?: boolean; agentInput?: boolean }): Promise<void>
-  pasteFromFile(name: string, filePath: string): Promise<void>
+  pasteFromFile(name: string, filePath: string, opts?: { enterCount?: 1 | 2 }): Promise<void>
   capturePane(name: string, lines?: number): Promise<string>
   /** Name of the process in the pane's foreground ('' when unknown). */
   getForegroundCommand?(name: string): Promise<string>
@@ -147,7 +148,7 @@ export class TmuxRuntime implements AgentRuntime {
   async sessionExists(name: string): Promise<boolean> {
     try {
       const sName = this.sanitizeName(name)
-      await execAsync(`tmux has-session -t "${sName}" 2>/dev/null`)
+      await execAsync(`tmux has-session -t "=${sName}" 2>/dev/null`)
       return true
     } catch {
       return false
@@ -193,14 +194,18 @@ export class TmuxRuntime implements AgentRuntime {
 
   // -- Lifecycle -----------------------------------------------------------
 
-  async createSession(name: string, cwd: string): Promise<void> {
+  async createSession(name: string, cwd: string, command: string[] = []): Promise<void> {
     const sName = this.sanitizeName(name)
-    await execFileAsync('tmux', ['new-session', '-d', '-s', sName, '-c', cwd])
+    // A new tmux server inherits the client's environment. Keep service
+    // credentials out of its global environment as well as the pane command.
+    const keys = ['PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'TERM', 'LANG', 'TMUX', 'TMUX_TMPDIR', 'XDG_RUNTIME_DIR']
+    const env = Object.fromEntries(keys.flatMap(key => process.env[key] === undefined ? [] : [[key, process.env[key]]]))
+    await execFileAsync('tmux', ['new-session', '-d', '-s', sName, '-c', cwd, ...command], { env })
   }
 
   async killSession(name: string): Promise<void> {
     const sName = this.sanitizeName(name)
-    await execAsync(`tmux kill-session -t "${sName}"`)
+    await execAsync(`tmux kill-session -t "=${sName}"`)
   }
 
   async renameSession(oldName: string, newName: string): Promise<void> {
@@ -243,70 +248,31 @@ export class TmuxRuntime implements AgentRuntime {
     }
   }
 
-  /**
-   * Paste text from a file into the pane via tmux load-buffer + paste-buffer.
-   * More reliable than send-keys -l for TUI apps (e.g., Codex) that don't
-   * handle literal key injection well. Sends Enter after pasting.
-   *
-   * Robust against tmux buffer races: load + paste + delete are chained in
-   * ONE shell invocation via `&&` so the buffer can't be eaten by another
-   * tmux client between the two execAsync calls (which previously caused
-   * the recurring "no buffer orch-collab-…" delivery failures).
-   *
-   * Retries up to 3x with exponential backoff (200ms, 400ms) before giving
-   * up — covers transient tmux server load and the rare case where another
-   * tmux process flushes the buffer-stack between load and paste.
-   */
-  async pasteFromFile(name: string, filePath: string): Promise<void> {
-    const sName = this.sanitizeName(name)
-    // Pasting is only ever used for agent input, never for shell commands.
+  /** Retry buffer loads only. After a paste attempt the input may already exist. */
+  async pasteFromFile(name: string, filePath: string, opts: { enterCount?: 1 | 2 } = {}): Promise<void> {
+    const target = this.sanitizeName(name)
     await this.assertAgentInForeground(name)
-    const bufName = `orch-${sName}`
-    const sPath = filePath.replace(/[^a-zA-Z0-9\-_./~ ]/g, '')
-
-    // Atomic chain: if load fails, paste/delete are short-circuited; if
-    // paste fails, we still attempt delete via the trailing `|| true` so
-    // we don't leak buffers between retry attempts.
-    const cmd = [
-      `tmux load-buffer -b "${bufName}" "${sPath}"`,
-      `tmux paste-buffer -b "${bufName}" -t "${sName}"`,
-      `tmux delete-buffer -b "${bufName}" 2>/dev/null || true`,
-    ].join(' && ')
-
-    let lastErr: unknown
-    const attempts = 3
-    let geplakt = false
-    for (let attempt = 1; attempt <= attempts && !geplakt; attempt++) {
-      try {
-        await execAsync(cmd, { shell: '/bin/bash' })
-        geplakt = true
-      } catch (err) {
-        lastErr = err
-        if (attempt < attempts) {
-          // Exponential backoff: 200ms, 400ms.
-          await new Promise(r => setTimeout(r, 200 * 2 ** (attempt - 1)))
+    const buffer = `orch-${randomUUID()}`
+    try {
+      for (let attempt = 0; ; attempt++) {
+        try {
+          await execFileAsync('tmux', ['load-buffer', '-b', buffer, filePath])
+          break
+        } catch (error) {
+          if (attempt === 2) throw error
+          await new Promise(resolve => setTimeout(resolve, 200 * 2 ** attempt))
         }
       }
+      await this.assertAgentInForeground(name)
+      await execFileAsync('tmux', ['paste-buffer', '-p', '-b', buffer, '-t', target])
+    } finally {
+      await execFileAsync('tmux', ['delete-buffer', '-b', buffer]).catch(() => {})
     }
-    if (!geplakt) {
-      throw lastErr instanceof Error
-        ? lastErr
-        : new Error(`pasteFromFile failed after ${attempts} attempts`)
-    }
-
-    // De Enters apart van de retry-lus hierboven: die lus omvatte ze eerder
-    // ook, waardoor een mislukte Enter de hele prompt opnieuw liet plakken in
-    // dezelfde pane. Give TUI time to process the paste, then send Enter twice
-    // (some TUIs like Gemini CLI need an extra Enter after paste); een
-    // mislukte Enter wordt gelogd maar triggert geen nieuwe paste.
-    await new Promise(r => setTimeout(r, 1000))
-    for (const wacht of [0, 300]) {
-      if (wacht) await new Promise(r => setTimeout(r, wacht))
-      try {
-        await execAsync(`tmux send-keys -t "${sName}" Enter`)
-      } catch (err) {
-        console.error(`[runtime] Enter naar ${sName} mislukte:`, err)
-      }
+    await new Promise(resolve => setTimeout(resolve, 1000))
+    for (let enter = 0; enter < (opts.enterCount ?? 2); enter++) {
+      if (enter) await new Promise(resolve => setTimeout(resolve, 300))
+      await this.assertAgentInForeground(name)
+      await execFileAsync('tmux', ['send-keys', '-t', target, 'Enter'])
     }
   }
 
@@ -323,8 +289,9 @@ export class TmuxRuntime implements AgentRuntime {
   }
 
   private async assertAgentInForeground(name: string): Promise<void> {
+    if (!await this.sessionExists(name)) throw new AgentNotRunningError(name, 'session unavailable')
     const command = await this.getForegroundCommand(name)
-    if (isShellCommand(command)) throw new AgentNotRunningError(name, command)
+    if (!command || isShellCommand(command)) throw new AgentNotRunningError(name, command)
   }
 
   async capturePane(name: string, lines: number = 2000): Promise<string> {

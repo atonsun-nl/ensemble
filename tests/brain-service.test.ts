@@ -25,6 +25,7 @@ beforeEach(async () => {
   createTree.mockReset().mockResolvedValue({ path: path.join(root, 'shared'), branch: 'ensemble/testteam', agentName: 'team' })
   vi.doMock('../lib/brain-hooks', () => ({ runPlan: plan, emitEvent: events, runRoster: vi.fn() }))
   vi.doMock('../lib/agent-spawner', () => ({
+      prepareLocalAgent: vi.fn(async () => undefined),
     spawnLocalAgent: spawn, killLocalAgent: vi.fn(async () => {}), spawnRemoteAgent: spawn,
     killRemoteAgent: vi.fn(), postRemoteSessionCommand: vi.fn(), isRemoteSessionReady: vi.fn(async () => true), getAgentTokenUsage: vi.fn(async () => 'unknown'),
   }))
@@ -90,11 +91,11 @@ it('rejects a worktree creation failure before spawning', async () => {
   expect(result.error).toContain('requires a git repository')
   expect(spawn).not.toHaveBeenCalled()
 })
-it('observes the completion sentinel once per agent message', async () => {
+it('ignores legacy completion sentinels from managed teams', async () => {
   const response = await finish(service.createEnsembleTeam({ name: 'done', description: 'Task', agents: [{ program: 'mimo' }, { program: 'codex' }] }))
   const team: EnsembleTeam = response.data!.team
   registry.appendMessage(team.id, { id: 'done-message', teamId: team.id, from: 'mimo-1', to: 'team', content: '<<COLLAB_DONE>>', type: 'chat', timestamp: new Date().toISOString() })
   await service.checkIdleTeams()
   await service.checkIdleTeams()
-  expect(events.mock.calls.filter(([event]) => (event as { event: string }).event === 'agent_done')).toHaveLength(1)
+  expect(events.mock.calls.filter(([event]) => (event as { event: string }).event === 'agent_done')).toHaveLength(0)
 })

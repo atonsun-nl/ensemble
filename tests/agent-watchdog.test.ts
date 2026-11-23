@@ -51,9 +51,9 @@ describe('AgentWatchdog', () => {
   let teams: EnsembleTeam[]
   let messages: EnsembleMessage[]
   let appended: EnsembleMessage[]
-  let sendKeys: ReturnType<typeof vi.fn>
-  let pasteFromFile: ReturnType<typeof vi.fn>
-  let postRemoteSessionCommand: ReturnType<typeof vi.fn>
+  let sendKeys: ReturnType<typeof vi.fn<() => Promise<void>>>
+  let pasteFromFile: ReturnType<typeof vi.fn<(session: string, file: string) => Promise<void>>>
+  let postRemoteSessionCommand: ReturnType<typeof vi.fn<() => Promise<void>>>
 
   beforeEach(() => {
     vi.restoreAllMocks()
@@ -62,7 +62,7 @@ describe('AgentWatchdog', () => {
     messages = [makeMessage({ timestamp: '2026-03-19T10:00:00.000Z' })]
     appended = []
     sendKeys = vi.fn(async () => {})
-    pasteFromFile = vi.fn(async () => {})
+    pasteFromFile = vi.fn<(session: string, file: string) => Promise<void>>(async () => {})
     postRemoteSessionCommand = vi.fn(async () => {})
   })
 
@@ -173,7 +173,7 @@ describe('AgentWatchdog', () => {
     nowMs += 91_000
     await watchdog.poll()
 
-    expect(pasteFromFile).toHaveBeenCalledWith('alpha-codex-1', path.resolve('tmp/watchdog/team-1/alpha-codex-1.txt'))
+    expect(pasteFromFile).toHaveBeenCalledWith('alpha-codex-1', expect.stringContaining(path.resolve('tmp/watchdog/team-1/alpha-codex-1.txt.')))
     expect(appended).toHaveLength(1)
     expect(appended[0].content).toContain('Watchdog nudged codex-1')
     watchdog.stop()

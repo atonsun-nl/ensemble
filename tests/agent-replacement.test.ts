@@ -15,6 +15,7 @@ const emit = vi.fn(async (_event: BrainEvent) => {})
 const spawn = vi.fn(async (_options: { name: string; program: string; workingDirectory: string }) => ({ id: 'replacement-id' }))
 const kill = vi.fn(async (_name: string) => {})
 const paste = vi.fn(async (_session: string, _file: string) => {})
+const sessionExists = vi.fn(async () => false)
 const ready = vi.fn(async () => true)
 let teamId: string
 beforeEach(async () => {
@@ -27,11 +28,13 @@ beforeEach(async () => {
   fs.writeFileSync(path.join(root, 'config.json'), JSON.stringify({ replaceStalledAgents: true, maxReplacementsPerTeam: 2, fallbackOrder: ['invalid', 'codex', 'glm', 'mimo', 'gemini'] }))
   roster.mockReset().mockResolvedValue({ glm: { status: 'limit' }, mimo: { status: 'ok' }, gemini: { status: 'ok' } })
   health.mockReset().mockResolvedValue({ warnings: [] })
+  sessionExists.mockReset().mockResolvedValue(false)
   emit.mockClear(); spawn.mockClear(); kill.mockClear(); paste.mockClear(); ready.mockReset().mockResolvedValue(true)
   vi.doMock('../lib/brain-hooks', () => ({ runRoster: roster, emitEvent: emit }))
   vi.doMock('../lib/agent-health', () => ({ checkAgentHealth: health }))
-  vi.doMock('../lib/agent-spawner', () => ({ spawnLocalAgent: spawn, killLocalAgent: kill, spawnRemoteAgent: vi.fn(), killRemoteAgent: vi.fn(), postRemoteSessionCommand: vi.fn() }))
-  vi.doMock('../lib/agent-runtime', () => ({ getRuntime: () => ({ pasteFromFile: paste, sendKeys: vi.fn(async () => {}) }) }))
+  vi.doMock('../lib/agent-spawner', () => ({
+          spawnLocalAgent: spawn, killLocalAgent: kill, spawnRemoteAgent: vi.fn(), killRemoteAgent: vi.fn(), postRemoteSessionCommand: vi.fn() }))
+  vi.doMock('../lib/agent-runtime', () => ({ getRuntime: () => ({ sessionExists, pasteFromFile: paste, sendKeys: vi.fn(async () => {}) }) }))
   vi.doMock('../lib/hosts-config', () => ({ isSelf: () => true, getHostById: vi.fn() }))
   registry = await import('../lib/ensemble-registry')
   replace = (await import('../lib/agent-replacement')).replaceTeamAgent
@@ -55,7 +58,7 @@ async function watch(exists: boolean) {
     markAgentFailed: registry.markAgentFailed, replacementEnabled: () => true, sessionExists: async () => exists,
     replaceAgent: (team, agent, detail) => replace(team.id, agent.name, detail, ready),
     onAgentStalled: (team, agent, detail) => { void emit({ event: 'agent_stalled', teamId: team.id, team: team.name, agent: agent.name, detail, ts: new Date(now).toISOString() }) },
-    getRuntime: () => ({ pasteFromFile: paste, sendKeys: vi.fn(async () => {}) }),
+    getRuntime: () => ({ sessionExists, pasteFromFile: paste, sendKeys: vi.fn(async () => {}) }),
     resolveAgentProgram: () => ({ inputMethod: 'pasteFromFile' }), isSelf: () => true,
     getHostById: () => undefined, postRemoteSessionCommand: vi.fn(),
     collabDeliveryFile: () => path.join(root, 'nudge'), now: () => now, nudgeAfterMs: 100, stallAfterMs: 100,
@@ -84,7 +87,7 @@ it('replaces after a successful nudge followed by a stall', async () => {
 it('includes the original task and bounded recent messages', async () => {
   for (let i = 0; i < 25; i++) registry.appendMessage(teamId, { id: `m-${i}`, teamId, from: 'codex-1', to: 'team', type: 'chat', timestamp: new Date(now + i).toISOString(), content: `marker-${i} ${'x'.repeat(1000)}` })
   expect(await replace(teamId, 'codex-1', 'gone', ready)).toBe(true)
-  const prompt = fs.readFileSync(paste.mock.calls[0][1], 'utf8')
+  const prompt = fs.readFileSync(path.join(root, 'runtime', teamId, 'prompts', 'mimo-2.txt'), 'utf8')
   expect(prompt).toContain('Original task')
   expect(prompt).toContain('marker-24')
   expect(prompt).not.toContain('marker-0 ')
@@ -124,4 +127,40 @@ it('does not leave a new session behind when disband begins during readiness', a
   expect(await replace(teamId, 'codex-1', 'gone', ready)).toBe(false)
   expect(kill).toHaveBeenCalledWith('replacement-mimo-2')
   expect(registry.getTeam(teamId)!.agents).toHaveLength(1)
+})
+
+function setManagedWorkflow() {
+  const team = registry.getTeam(teamId)!
+  team.agents[0].role = 'worker'
+  registry.updateTeam(teamId, {
+    agents: team.agents,
+    workflow: {
+      state: 'BLOCKED', requireLeadReady: true, lead: 'another-lead', startupDeadline: new Date(now).toISOString(),
+      plan: 'Assign result.txt', fileOwners: { 'result.txt': 'codex-1' }, taskOwners: { fix: 'codex-1' },
+      blockers: { 'codex-1': 'unverified baseline' }, submitted: {}, approvedChanges: [], handled: [],
+      decisions: ['Keep previous edits'],
+    },
+  })
+}
+
+it('reassigns managed ownership only after shutdown and preserves the working tree', async () => {
+  setManagedWorkflow()
+  const workspace = path.join(root, 'shared')
+  fs.mkdirSync(workspace)
+  fs.writeFileSync(path.join(workspace, 'result.txt'), 'uncommitted work')
+  expect(await replace(teamId, 'codex-1', 'CLI exited', ready)).toBe(true)
+  expect(kill.mock.invocationCallOrder[0]).toBeLessThan(spawn.mock.invocationCallOrder[0])
+  expect(fs.readFileSync(path.join(workspace, 'result.txt'), 'utf8')).toBe('uncommitted work')
+  expect(registry.getTeam(teamId)?.workflow).toMatchObject({
+    fileOwners: { 'result.txt': 'mimo-2' }, taskOwners: { fix: 'mimo-2' },
+    blockers: { 'mimo-2': 'unverified baseline' }, decisions: ['Keep previous edits'],
+  })
+})
+
+it('refuses managed replacement while the previous session can still write', async () => {
+  setManagedWorkflow()
+  sessionExists.mockResolvedValue(true)
+  expect(await replace(teamId, 'codex-1', 'CLI exited', ready)).toBe(false)
+  expect(spawn).not.toHaveBeenCalled()
+  expect(registry.getTeam(teamId)?.workflow?.fileOwners['result.txt']).toBe('codex-1')
 })

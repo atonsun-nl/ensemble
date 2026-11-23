@@ -71,6 +71,7 @@ The `agents.json` file defines which AI agents ensemble can spawn. Located in th
     "flags": ["--always-approve", "--trust"],
     "readyMarker": "❯",
     "inputMethod": "pasteFromFile",
+    "pasteEnterCount": 1,
     "color": "white",
     "icon": "✕"
   }
@@ -91,6 +92,7 @@ The `agents.json` file defines which AI agents ensemble can spawn. Located in th
 | `flags` | string[] | Default CLI arguments |
 | `readyMarker` | string | Terminal prompt character (readiness detection) |
 | `inputMethod` | `"pasteFromFile"` or `"sendKeys"` | How to deliver multi-line prompts |
+| `pasteEnterCount` | `1` or `2` | Enter presses after local paste delivery (default `2`). Grok uses `1` to queue messages without cancelling its active turn. |
 | `color` | string | Display color in TUI monitor |
 | `icon` | string | Single character icon for TUI |
 
@@ -114,16 +116,22 @@ Any CLI tool that reads from stdin and writes to stdout can be an ensemble agent
 
 The agent must support `team-say` and `team-read` shell commands in its PATH for inter-agent communication.
 
+For Grok, keep `pasteEnterCount: 1` in custom agent configurations. This
+guards against extra Enter presses on the empty composer. Local paste
+operations are serialized per pane. Managed teams use the inbox for ongoing
+status and coordination messages. Attributing a Grok `send_now` event requires
+a trace from the actual CLI.
+
 ### Supported agents
 
 The default team is **Codex (lead) + Claude Code (worker)**. This is the fully tested combination.
 
 | Agent | Status | Default? | Notes |
 |---|---|---|---|
-| **Codex** | Fully tested | Yes (lead) | Uses `pasteFromFile` input, `--dangerously-bypass-approvals-and-sandbox` flag |
+| **Codex** | Fully tested | Yes (lead) | Uses `pasteFromFile` and `--dangerously-bypass-approvals-and-sandbox --model gpt-6.1-sol --config model_reasoning_effort="high"` |
 | **Claude Code** | Fully tested | Yes (worker) | Uses `sendKeys` input |
-| **Grok CLI** | Tested in three-agent teams | No | Uses `pasteFromFile`, `--always-approve --trust`. Needs `hints = { project_picker_disabled = true }` in `~/.grok/config.toml`, otherwise the agent hangs on a directory picker in a fresh pane. |
-| **Antigravity CLI (`agy`)** | Configured | No | Uses `sendKeys`, `--dangerously-skip-permissions`, and unsets `GEMINI_API_KEY` and `GOOGLE_API_KEY` before launch. |
+| **Grok CLI** | Tested in three-agent teams | No | Uses `pasteFromFile`, `--always-approve --trust --model grok-4.7 --effort xhigh --max-turns 30`. Needs `hints = { project_picker_disabled = true }` in `~/.grok/config.toml`, otherwise the agent hangs on a directory picker in a fresh pane. |
+| **Antigravity CLI (`agy`)** | Configured | No | Uses `sendKeys`, `--dangerously-skip-permissions --model gemini-3.8-flash-high --effort high`, and unsets `GEMINI_API_KEY` and `GOOGLE_API_KEY` before launch. |
 | **Gemini CLI** | Experimental | No | Uses `pasteFromFile`, `--yolo` flag. May stop responding due to free-tier rate limits or internal TUI issues. Use a paid API key (`gemini /auth`) for best results. |
 | **GLM** | Tested in four-agent teams | No | Runs Claude Code against the Z.ai endpoint, so it behaves like `claude` (`sendKeys`, `--permission-mode auto`) with a GLM model underneath. Needs a `glm` command on PATH that sets `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN`. |
 | **MiMo Code CLI** | Configured | No | `mimo`, `--trust --dangerously-skip-permissions`, file-based prompt delivery |
@@ -347,3 +355,108 @@ these variables after environment exports, including `agentEnv`, before launchin
 the CLI. For agy this prevents inherited API keys from selecting paid API tokens
 instead of subscription authentication. Its trust prompt uses the existing startup
 gate, which confirms the preselected "Yes, I trust this folder" option.
+
+
+## Managed teams
+
+For a team with multiple agents, Ensemble validates the configured local
+executables before creating any panes. The Lead must pass CLI readiness and
+receive its prompt. Worker CLIs can initialize while the Lead prepares its plan.
+Ensemble releases worker prompts after acknowledging the Lead's plan. Workers
+wait for file and task assignments and report their completed work for review.
+Existing teams without a workflow record retain the exact one-time
+`<<COLLAB_DONE>>` protocol.
+
+Use `team-say <team-id> <actor> team '<<COLLAB_EVENT>> {"action":"…"}'`
+to record a workflow action. The feed records accepted and rejected actions.
+
+| Action | Actor | Required fields |
+|---|---|---|
+| `plan` | Lead | `plan` |
+| `assign` | Lead | `task`, `owner`, `paths`. A conflicting takeover requires `takeover: true` and `reason`. |
+| `release` | Lead | `task`, optionally `paths` |
+| `block`, `unblock` | Team member | `reason` for `block`. The Lead can supply `owner` to clear a teammate's blocker. |
+| `decision` | Lead | `decision` |
+| `change` | Lead | `paths`, repository-relative `test`, `counterexample` |
+| `submit` | Assigned agent or Lead | `report` |
+| `accept` | Lead | The service runs the configured checks once assigned work has been submitted and blockers have cleared. Outside Git, a report-only task requires `analysisOnly: true` when no checks are configured. |
+| `close` | Lead | `report`, after acceptance |
+| `activity` | Team member | `state` (`busy` or `idle`), optional `tool` |
+
+Use `team-read <team-id> <agent-name>` to read and acknowledge queued messages
+at a safe point. `--wait` polls for up to 120 seconds. `--all` includes
+previously read messages. Delivery records show when input was queued or read.
+The service does not inject ordinary messages or watchdog nudges into managed
+panes. An `activity` event is a cooperative report from the agent. It does
+not trace internal CLI tool calls.
+
+The assignment registry rejects overlapping paths, including directory/file
+overlap. Keep claims through review so acceptance can verify that changed
+paths have registered owners. Use `worktree: "team"` for a retained shared
+review branch. For per-agent worktrees, integrate each branch into the review
+branch and clean its worktree before acceptance. Managed teams retain all
+worktrees for review. Agents with unrestricted shell access can bypass
+coordination and write directly, so review the Git diff for ownership and
+semantic conflicts.
+
+### Acceptance checks
+
+Set trusted commands in the server's Ensemble config file. Each check
+receives argv directly and runs from the review worktree. Commands and
+expected baseline failures come from operator configuration.
+
+```json
+{
+  "acceptanceChecks": [
+    { "command": "npm", "args": ["run", "typecheck"] },
+    {
+      "command": "bash",
+      "args": ["tests/regression.sh"],
+      "regression": true,
+      "baselineFailure": "expected available timestamp"
+    }
+  ],
+  "criticalPaths": ["src/labeling", "src/split.ts"],
+  "allowAgentCommits": false
+}
+```
+
+A regression check copies the first argument, its repository-relative test
+entry point, into a detached baseline worktree. It requires exit code `1`
+and the configured diagnostic there, then exit code `0` in the candidate.
+Use a self-contained test entry point or keep its dependencies available on
+both revisions. Changed critical paths require a Lead change request naming
+a configured regression test and recording a counterexample. Accepting code
+changes requires both registered path ownership and configured checks. The
+service stores the baseline and candidate SHA, binary-capable Git diff,
+untracked-file hashes, exit codes and stdout/stderr in an acceptance artifact.
+Changes to the reviewed Git snapshot invalidate acceptance at close.
+
+### Recovery and preflight
+
+A service restart preserves active teams and their journals regardless of age.
+A missing Lead aborts the run and preserves its worktree unless the service
+can safely replace the Lead before dispatching work. Worker replacement stops
+and verifies the previous session first, then transfers the open assignments
+and decisions. Configure `replaceStalledAgents`, `maxReplacementsPerTeam` and
+`fallbackOrder` to enable and bound replacement. Worker replacement preserves
+uncommitted changes and requires a fresh submission for the new owner.
+
+`maxTeamMinutes` and `maxIdleMinutes` are optional limits with a configurable
+`graceMinutes` period. Use `ENSEMBLE_MAX_TEAM_MINUTES`,
+`ENSEMBLE_MAX_IDLE_MINUTES` and `ENSEMBLE_GRACE_MINUTES` for environment overrides.
+
+Codex preflight resolves the same executable and effective flags used for
+launch. It checks the version, interactive flag parsing and local login
+status. Set `codexSmokeCheck: true` or `ENSEMBLE_CODEX_SMOKE_CHECK=1` to verify
+provider availability for the selected profile, model and reasoning effort.
+That opt-in check invokes the model with the noninteractive CLI.
+
+For strict startup on a remote host, the Maestro session status response
+must report `exists: true`, a non-shell `foregroundCommand` and either
+`ready: true` or `output` containing the agent's ready marker. A status response
+that reports only session existence works with the explicit compatibility
+setting `requireLeadReady: false`. Remote agents need access to the team feed
+and a bridge or shared journal to publish events. Configure the bridge's
+operator credentials separately from the agent environment. Validate remote
+changes in the local review worktree before acceptance.

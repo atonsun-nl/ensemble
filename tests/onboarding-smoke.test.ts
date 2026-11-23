@@ -48,6 +48,7 @@ async function waitForHealthy(baseUrl: string): Promise<void> {
 describe('onboarding smoke test', () => {
   const originalEnv = { ...process.env }
   const runtime = {
+    getForegroundCommand: vi.fn(async () => 'agent'),
     capturePane: vi.fn(async () => '>'),
     sendKeys: vi.fn(async () => {}),
     pasteFromFile: vi.fn(async () => {}),
@@ -69,6 +70,7 @@ describe('onboarding smoke test', () => {
 
     vi.resetModules()
     vi.doMock('../lib/agent-spawner', () => ({
+      prepareLocalAgent: vi.fn(async () => undefined),
       spawnLocalAgent: vi.fn(async ({ name, program, workingDirectory, hostId }) => ({
         id: `${name}-id`,
         name,
@@ -88,6 +90,7 @@ describe('onboarding smoke test', () => {
       getRuntime: vi.fn(() => runtime),
     }))
     vi.doMock('../lib/agent-config', () => ({
+      shellEscape: (value: string) => value,
       resolveAgentProgram: vi.fn(() => ({ readyMarker: '>', inputMethod: 'sendKeys' })),
       resolveAgentProgramDetailed: vi.fn((program: string) => ({
         agent: { command: program, readyMarker: '>', inputMethod: 'sendKeys' },

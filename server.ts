@@ -4,17 +4,43 @@
  */
 
 import http from 'http'
+import { timingSafeEqual, createHash } from 'crypto'
+import { isIP } from 'net'
 import fs from 'fs'
 import os from 'os'
 // Alias, want de request-handler gebruikt de naam `path` al voor de URL-pathname.
 import nodePath from 'path'
-import {
-  createEnsembleTeam, getEnsembleTeam, listEnsembleTeams,
-  getTeamFeed, sendTeamMessage, disbandTeam,
-} from './services/ensemble-service'
-
 const PORT = parseInt(process.env.ENSEMBLE_PORT || process.env.ORCHESTRA_PORT || '23000', 10)
 const HOST = process.env.ENSEMBLE_HOST || '127.0.0.1'
+const token = process.env.ENSEMBLE_API_TOKEN?.trim()
+if (token && !/^[!-~]+$/.test(token)) {
+  console.error('[Ensemble] ENSEMBLE_API_TOKEN must be a single printable token')
+  process.exit(1)
+}
+const normalizeIp = (ip: string) => ip.replace(/^::ffff:/, '')
+const isLoopback = (ip: string) => ip === 'localhost' || ip === '::1' || /^127\./.test(ip) && isIP(ip) === 4
+const trustedProxies = new Set((process.env.ENSEMBLE_TRUSTED_PROXIES || '').split(',').map(ip => normalizeIp(ip.trim())).filter(ip => isIP(ip)))
+if (!isLoopback(normalizeIp(HOST)) &&
+    (process.env.ENSEMBLE_ALLOW_EXTERNAL !== '1' || !token || token.length < 32)) {
+  console.error('[Ensemble] External bind requires ENSEMBLE_ALLOW_EXTERNAL=1 and ENSEMBLE_API_TOKEN with at least 32 characters')
+  process.exit(1)
+}
+if (trustedProxies.size && (!token || token.length < 32)) {
+  console.error('[Ensemble] Trusted proxies require ENSEMBLE_API_TOKEN with at least 32 characters')
+  process.exit(1)
+}
+
+const {
+  createEnsembleTeam, getEnsembleTeam, listEnsembleTeams,
+  getTeamFeed, sendTeamMessage, disbandTeam,
+} = await import('./services/ensemble-service')
+
+const digest = (value: string) => createHash('sha256').update(value).digest()
+const authDigest = token ? digest(`Bearer ${token}`) : undefined
+function isAuthorized(req: http.IncomingMessage): boolean {
+  return !authDigest || timingSafeEqual(authDigest, digest(req.headers.authorization || ''))
+}
+
 const RATE_LIMIT_WINDOW_MS = 60_000
 const RATE_LIMIT_MAX_REQUESTS = 100
 const DEFAULT_CORS_ORIGIN_PATTERNS = [
@@ -38,7 +64,7 @@ setInterval(() => {
       rateLimitByIp.delete(ip)
     }
   }
-}, 60_000)
+}, 60_000).unref()
 
 function getAllowedCorsOrigins(): string[] {
   const configured = process.env.ENSEMBLE_CORS_ORIGIN?.trim()
@@ -60,7 +86,7 @@ function buildCorsHeaders(origin?: string): Record<string, string> {
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     'Access-Control-Allow-Methods': 'GET,POST,DELETE,OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
     'Vary': 'Origin',
   }
 
@@ -77,22 +103,30 @@ function json(res: http.ServerResponse, data: unknown, status = 200, origin?: st
 }
 
 async function readBody(req: http.IncomingMessage): Promise<string> {
+  let body = ''
+  let size = 0
   return new Promise((resolve, reject) => {
-    let body = ''
-    req.on('data', chunk => body += chunk)
-    req.on('end', () => resolve(body))
-    req.on('error', reject)
+    req.setEncoding('utf8')
+    req.on('data', (chunk: string) => {
+      size += Buffer.byteLength(chunk)
+      if (size > 1024 * 1024) {
+        reject(new Error('Request body too large'))
+        return
+      }
+      body += chunk
+    })
+    req.once('end', () => resolve(body))
+    req.once('error', reject)
   })
 }
 
 function getClientIp(req: http.IncomingMessage): string {
-  const forwardedFor = req.headers['x-forwarded-for']
-  if (typeof forwardedFor === 'string') {
-    const firstIp = forwardedFor.split(',')[0]?.trim()
-    if (firstIp) return firstIp
-  }
-
-  return req.socket.remoteAddress || 'unknown'
+  const peer = normalizeIp(req.socket.remoteAddress || 'unknown')
+  const forwarded = req.headers['x-forwarded-for']
+  if (!trustedProxies.has(peer) || typeof forwarded !== 'string') return peer
+  const chain = forwarded.split(',').map(item => normalizeIp(item.trim()))
+  if (!chain.every(ip => isIP(ip))) return peer
+  return chain.reverse().find(ip => !trustedProxies.has(ip)) || peer
 }
 
 function isRateLimited(ip: string): boolean {
@@ -165,6 +199,12 @@ const server = http.createServer(async (req, res) => {
       return json(res, { error: 'Rate limit exceeded' }, 429, origin)
     }
 
+    const peer = normalizeIp(req.socket.remoteAddress || 'unknown')
+    const publicRequest = !isLoopback(peer) || trustedProxies.has(peer)
+    if (path.startsWith('/api/ensemble/') && (method !== 'GET' || publicRequest) && !isAuthorized(req)) {
+      return json(res, { error: 'Unauthorized' }, 401, origin)
+    }
+
     // List teams / Create team
     if (path === '/api/ensemble/teams') {
       if (method === 'GET') {
@@ -178,8 +218,9 @@ const server = http.createServer(async (req, res) => {
         } catch {
           return json(res, { error: 'Bad Request: malformed JSON' }, 400, origin)
         }
+        if (!body || typeof body !== 'object' || Array.isArray(body)) return json(res, { error: 'Invalid team request' }, 400, origin)
         const result = await createEnsembleTeam(body as Parameters<typeof createEnsembleTeam>[0])
-        if (result.error) return json(res, { error: result.error }, result.status, origin)
+        if (result.error) return json(res, { error: result.error, ...result.data }, result.status, origin)
         return json(res, result.data, result.status, origin)
       }
     }
@@ -200,7 +241,8 @@ const server = http.createServer(async (req, res) => {
         } catch {
           return json(res, { error: 'Bad Request: malformed JSON' }, 400, origin)
         }
-        const result = await sendTeamMessage(teamId, (body.to as string) || 'team', body.content as string, body.from as string, body.id as string, body.timestamp as string)
+        if (!body || typeof body !== 'object' || Array.isArray(body)) return json(res, { error: 'Invalid message' }, 400, origin)
+        const result = await sendTeamMessage(teamId, (body.to as string) || 'team', body.content as string, body.from as string, body.id as string, body.timestamp as string, body.priority === 'urgent' ? 'urgent' : 'normal')
         if (result.error) return json(res, { error: result.error }, result.status, origin)
         return json(res, result.data, result.status, origin)
       }
@@ -223,14 +265,14 @@ const server = http.createServer(async (req, res) => {
     const feedMatch = path.match(/^\/api\/ensemble\/teams\/([^/]+)\/feed$/)
     if (feedMatch && method === 'GET') {
       const since = url.searchParams.get('since') || undefined
-      const result = getTeamFeed(feedMatch[1], since)
+      const result = getTeamFeed(feedMatch[1], since, url.searchParams.get('recipient') || undefined)
       if (result.error) return json(res, { error: result.error }, result.status, origin)
       return json(res, result.data, result.status, origin)
     }
 
     json(res, { error: 'Not found' }, 404, origin)
   } catch (err) {
-    console.error('[Server] Error:', err)
+    console.error('[Server] Request failed:', err instanceof Error ? err.name : 'unknown error')
     json(res, { error: 'Internal server error' }, 500, origin)
   }
 })
@@ -249,3 +291,12 @@ server.listen(PORT, HOST, () => {
   console.log(`[Ensemble] Server running on http://${HOST}:${PORT}`)
   console.log(`[Ensemble] Health: http://localhost:${PORT}/api/v1/health`)
 })
+
+
+for (const signal of ['SIGINT', 'SIGTERM'] as const) {
+  process.once(signal, () => {
+    server.close()
+    server.closeIdleConnections()
+    setTimeout(() => server.closeAllConnections(), 5000).unref()
+  })
+}

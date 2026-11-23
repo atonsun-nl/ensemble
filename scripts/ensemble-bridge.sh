@@ -94,7 +94,7 @@ while true; do
     # erft nu gewoon bash's eigen stderr, dat de launcher al naar het bridge-log
     # stuurt; er is dus geen aparte capture-en-echo-stap meer nodig.
     python3 - "$TEAM_ID" "$API" "$POSTED" "$FILE" <<'PY' >"$RESULT_FILE" &
-import json, signal, sys, time, urllib.error, urllib.parse, urllib.request
+import json, os, signal, sys, time, urllib.error, urllib.parse, urllib.request
 from itertools import islice
 
 team_id, api, posted_raw, messages_path = sys.argv[1:5]
@@ -147,10 +147,13 @@ try:
                 'timestamp': msg.get('timestamp',''),
             }).encode()
 
+            headers = {'Content-Type': 'application/json'}
+            if os.environ.get('ENSEMBLE_API_TOKEN'):
+                headers['Authorization'] = 'Bearer ' + os.environ['ENSEMBLE_API_TOKEN']
             req = urllib.request.Request(
                 f'{api}/api/ensemble/teams/{urllib.parse.quote(team_id, safe="")}',
                 data=data,
-                headers={'Content-Type': 'application/json'},
+                headers=headers,
                 method='POST'
             )
             success = False
@@ -165,7 +168,7 @@ try:
                     # error, permanent overslaan", waardoor een bericht bij een
                     # rate limit of een timeout definitief verdween in plaats van
                     # dat het opnieuw geprobeerd werd.
-                    if e.code in (408, 429):
+                    if e.code in (401, 403, 408, 429):
                         delay = min(30.0, 0.5 * (2 ** attempt))
                         print(f'[bridge] {e.code} on line {i}, retry {attempt+1}/10 in {delay:.1f}s', file=sys.stderr, flush=True)
                         if attempt == 9:

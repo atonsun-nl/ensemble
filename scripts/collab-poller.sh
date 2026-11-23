@@ -52,7 +52,7 @@ flush() {
 # cannot be reached, and "alive" otherwise.
 team_state() {
   local code body
-  body=$(curl -s -o - -w '\n%{http_code}' --max-time 5 "$API/api/ensemble/teams/$TEAM_ID" 2>/dev/null) || { echo down; return; }
+  body=$(ensemble_curl -s -o - -w '\n%{http_code}' --max-time 5 "$API/api/ensemble/teams/$TEAM_ID" 2>/dev/null) || { echo down; return; }
   code="${body##*$'\n'}"
   case "$code" in
     404) echo gone ;;

@@ -2,6 +2,7 @@ import fs from 'fs'
 import os from 'os'
 import path from 'path'
 import net from 'net'
+import { spawnSync } from 'child_process'
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 
 // server.ts had `path.startsWith('/api/ensemble/')` as its rate-limit
@@ -48,7 +49,9 @@ async function waitForHealthy(baseUrl: string): Promise<void> {
 
 describe('rate limiting', () => {
   const originalEnv = { ...process.env }
+  const token = 'an-isolated-test-bearer-with-32-chars'
   const runtime = {
+    getForegroundCommand: vi.fn(async () => 'agent'),
     capturePane: vi.fn(async () => '>'),
     sendKeys: vi.fn(async () => {}),
     pasteFromFile: vi.fn(async () => {}),
@@ -68,10 +71,15 @@ describe('rate limiting', () => {
 
     process.env.ENSEMBLE_DATA_DIR = tempRoot
     process.env.ENSEMBLE_PORT = String(port)
+    process.env.ENSEMBLE_HOST = '0.0.0.0'
+    process.env.ENSEMBLE_ALLOW_EXTERNAL = '1'
+    process.env.ENSEMBLE_API_TOKEN = token
+    delete process.env.ENSEMBLE_TRUSTED_PROXIES
     process.env.ENSEMBLE_URL = baseUrl
 
     vi.resetModules()
     vi.doMock('../lib/agent-spawner', () => ({
+      prepareLocalAgent: vi.fn(async () => undefined),
       spawnLocalAgent: vi.fn(async ({ name, program, workingDirectory, hostId }) => ({
         id: `${name}-id`, name, program, sessionName: name, workingDirectory, hostId,
       })),
@@ -86,6 +94,7 @@ describe('rate limiting', () => {
       getRuntime: vi.fn(() => runtime),
     }))
     vi.doMock('../lib/agent-config', () => ({
+      shellEscape: (value: string) => value,
       resolveAgentProgram: vi.fn(() => ({ readyMarker: '>', inputMethod: 'sendKeys' })),
       resolveAgentProgramDetailed: vi.fn((program: string) => ({
         agent: { command: program, readyMarker: '>', inputMethod: 'sendKeys' },
@@ -105,7 +114,7 @@ describe('rate limiting', () => {
 
     const createRes = await fetch(`${baseUrl}/api/ensemble/teams`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
       body: JSON.stringify({
         name: 'rate-limit-team',
         description: 'test',
@@ -122,6 +131,19 @@ describe('rate limiting', () => {
     fs.rmSync(tempRoot, { recursive: true, force: true })
     vi.resetModules()
     vi.restoreAllMocks()
+  })
+
+  it('rejects unauthenticated create, message and stop requests', async () => {
+    for (const [method, target] of [
+      ['POST', '/api/ensemble/teams'],
+      ['POST', `/api/ensemble/teams/${teamId}`],
+      ['POST', `/api/ensemble/teams/${teamId}/disband`],
+      ['DELETE', `/api/ensemble/teams/${teamId}`],
+    ]) {
+      const result = await fetch(baseUrl + target, { method, headers: { 'X-Forwarded-For': '127.0.0.1' } })
+      expect(result.status).toBe(401)
+      expect(await result.text()).not.toContain(token)
+    }
   })
 
   it('feed en team-detail blijven vrij, de lijst-route niet', async () => {
@@ -141,9 +163,18 @@ describe('rate limiting', () => {
     // team-picker raken hem, eenmalig) en moet dus wél gelimiteerd blijven.
     let listRateLimited = false
     for (let i = 0; i < 105; i++) {
-      const res = await fetch(`${baseUrl}/api/ensemble/teams`)
+      const res = await fetch(`${baseUrl}/api/ensemble/teams`, { headers: { 'X-Forwarded-For': `192.0.2.${i + 1}` } })
       if (res.status === 429) { listRateLimited = true; break }
     }
     expect(listRateLimited, 'de lijst-route moet na 100 GETs alsnog een 429 geven').toBe(true)
   })
+})
+
+it('refuses external bind without both opt-in and a token', () => {
+  const result = spawnSync(process.execPath, ['--import', 'tsx', 'server.ts'], {
+    encoding: 'utf8', timeout: 5000,
+    env: { ...process.env, ENSEMBLE_HOST: '0.0.0.0', ENSEMBLE_ALLOW_EXTERNAL: '1', ENSEMBLE_API_TOKEN: '' },
+  })
+  expect(result.status).toBe(1)
+  expect(result.stderr).toContain('External bind requires')
 })

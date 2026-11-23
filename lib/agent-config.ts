@@ -4,6 +4,7 @@
  */
 
 import fs from 'fs'
+import { readEnsembleConfig } from './ensemble-config'
 import path from 'path'
 import { fileURLToPath } from 'url'
 import type { AgentProgram, AgentsConfig } from '../types/agent-program'
@@ -43,6 +44,9 @@ export function loadAgentsConfig(): AgentsConfig {
   const raw = fs.readFileSync(configPath, 'utf-8')
   const config = JSON.parse(raw) as AgentsConfig
   for (const [key, agent] of Object.entries(config)) {
+    if (agent.pasteEnterCount !== undefined && agent.pasteEnterCount !== 1 && agent.pasteEnterCount !== 2) {
+      throw new Error(`Invalid pasteEnterCount for agent "${key}": expected 1 or 2`)
+    }
     if (agent.unsetEnv !== undefined && (
       !Array.isArray(agent.unsetEnv)
       || !agent.unsetEnv.every(name => typeof name === 'string' && /^[A-Z_][A-Z0-9_]*$/.test(name) && !/[\r\n]/.test(name))
@@ -171,4 +175,31 @@ export function buildAgentCommandParts(program: string): string[] {
  */
 export function buildAgentCommand(program: string): string {
   return buildAgentCommandParts(program).map(shellEscape).join(' ')
+}
+
+const sharedEnvironment = new Set([
+  'PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'LANG', 'TMPDIR',
+  'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'SSH_AUTH_SOCK',
+  'CODEX_HOME', 'CLAUDE_CONFIG_DIR', 'COLLAB_RUNTIME_ROOT', 'ENSEMBLE_URL',
+])
+
+export function buildAgentEnvironment(program: string): Record<string, string> {
+  const agent = resolveAgentProgram(program)
+  const provider = program.toLowerCase()
+  const prefixes = [
+    ...(provider.includes('codex') ? ['OPENAI_', 'CODEX_API_KEY'] : []),
+    ...(/claude|glm/.test(provider) ? ['ANTHROPIC_', 'CLAUDE_CODE_OAUTH_'] : []),
+    ...(/grok/.test(provider) ? ['XAI_', 'GROK_'] : []),
+    ...(/agy|gemini/.test(provider) ? ['GOOGLE_', 'GEMINI_'] : []),
+    'LC_',
+  ]
+  const environment: Record<string, string> = {}
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value !== undefined && (sharedEnvironment.has(key) || prefixes.some(prefix => key.startsWith(prefix)))) {
+      environment[key] = value
+    }
+  }
+  Object.assign(environment, readEnsembleConfig().agentEnv)
+  for (const key of ['CLAUDECODE', 'ENSEMBLE_API_TOKEN', ...(agent.unsetEnv ?? [])]) delete environment[key]
+  return environment
 }

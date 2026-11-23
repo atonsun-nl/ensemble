@@ -47,6 +47,7 @@ describe('sessieregister (service)', () => {
     const sessionsFile = path.join(tempRoot, `${team.id}.sessions`)
     const runtime = {
       capturePane: vi.fn(async () => '>'),
+      getForegroundCommand: vi.fn(async () => 'agent'),
       sendKeys: vi.fn(async (sessionName: string) => { order.push(`inject:${sessionName}`) }),
       pasteFromFile: vi.fn(async (sessionName: string) => { order.push(`inject:${sessionName}`) }),
     }
@@ -60,6 +61,7 @@ describe('sessieregister (service)', () => {
       getMessages: vi.fn(() => []),
     }))
     vi.doMock('../lib/agent-spawner', () => ({
+      prepareLocalAgent: vi.fn(async () => undefined),
       spawnLocalAgent: vi.fn(async ({ name }: { name: string }) => ({ id: `${name}-id` })),
       killLocalAgent: vi.fn(async () => {}),
       spawnRemoteAgent: vi.fn(async () => ({ id: 'remote-agent-id' })),
@@ -77,6 +79,7 @@ describe('sessieregister (service)', () => {
       getRuntime: vi.fn(() => runtime),
     }))
     vi.doMock('../lib/agent-config', () => ({
+      shellEscape: (value: string) => value,
       resolveAgentProgram: vi.fn(() => ({ readyMarker: '>', inputMethod: 'sendKeys' })),
       resolveAgentProgramDetailed: vi.fn((program: string) => ({
         agent: { command: program, readyMarker: '>', inputMethod: 'sendKeys' },
@@ -128,11 +131,11 @@ describe('sessieregister (service)', () => {
     const order: string[] = []
     const { mod, sessionsFile } = await setupService(team, order)
 
-    const originalWrite = fs.writeFileSync.bind(fs)
-    const writeSpy = vi.spyOn(fs, 'writeFileSync').mockImplementation(((file: fs.PathOrFileDescriptor, data: string | NodeJS.ArrayBufferView, opts?: fs.WriteFileOptions | BufferEncoding) => {
+    const originalAppend = fs.appendFileSync.bind(fs)
+    const writeSpy = vi.spyOn(fs, 'appendFileSync').mockImplementation(((file: fs.PathOrFileDescriptor, data: string | Uint8Array, opts?: fs.WriteFileOptions) => {
       if (String(file) === sessionsFile) order.push('register-written')
-      return originalWrite(file, data, opts)
-    }) as typeof fs.writeFileSync)
+      return originalAppend(file, data, opts)
+    }) as typeof fs.appendFileSync)
 
     await mod.createEnsembleTeam({
       name: team.name,

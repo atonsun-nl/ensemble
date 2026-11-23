@@ -1,55 +1,66 @@
-/**
- * De codex-probe mag niet zoeken naar iets dat hij zelf heeft meegestuurd.
- *
- * Tot 20-09-2026 vroeg de prompt letterlijk om de sentinel PROBE-OK-7391 terug
- * te typen, en grepte de check op diezelfde string. Codex echoot elke prompt
- * terug onder het kopje 'user', dus de sentinel stond altijd in de uitvoer.
- * Gemeten met een ingetrokken refresh token: 401 op alles, geen enkel antwoord,
- * en de preflight meldde "Codex works".
- *
- * Deze test controleert de eigenschap die dat onmogelijk maakt: wat de probe
- * zoekt, mag niet in wat de probe stuurt voorkomen. Een eerdere versie telde
- * unieke sentinels, maar de oude code gebruikte twee keer dezelfde string, dus
- * die telling gaf 1 en de test was groen op precies de bug die hij moest vangen.
- */
 import fs from 'fs'
+import os from 'os'
 import path from 'path'
-import { describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, expect, it, vi } from 'vitest'
+import { checkCodexLaunch, resolveExecutable } from '../lib/agent-preflight'
 
-const SRC = fs.readFileSync(path.resolve(process.cwd(), 'scripts/collab-preflight.sh'), 'utf8')
+let root: string
+let first: string
+let second: string
+let report: string
+beforeEach(() => {
+  root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-preflight-'))
+  first = path.join(root, 'first')
+  second = path.join(root, 'second')
+  report = path.join(root, 'called')
+  for (const directory of [first, second]) {
+    fs.mkdirSync(directory)
+    fs.writeFileSync(path.join(directory, 'codex'), `#!/bin/sh
+printf '%s\\n' "$0 $*" >> "$CALL_LOG"
+case " $* " in
+  *' --unsupported '*) exit 2 ;;
+esac
+case "$1" in
+  --version) echo 'codex-cli 9.1';;
+  login) echo 'Logged in using ChatGPT';;
+  exec) printf '%s\\n' "$SMOKE_OUTPUT"; exit "${'${SMOKE_EXIT:-0}'}";;
+esac
+`, { mode: 0o755 })
+  }
+})
+afterEach(() => {
+  vi.unstubAllEnvs()
+  fs.rmSync(root, { recursive: true, force: true })
+})
 
-/** De prompttekst die als argument aan `codex exec` meegaat. */
-function probePrompt(): string {
-  const m = SRC.match(/codex exec[^\n]*\n?\s*"([^"]+)"/)
-  if (!m) throw new Error('geen codex exec prompt gevonden in collab-preflight.sh')
-  return m[1]
+const flags = ['--model', 'assigned-model', '--config', 'model_reasoning_effort="xhigh"', '--no-alt-screen']
+function environment(overrides: Record<string, string> = {}) {
+  return { PATH: `${first}:${second}`, CALL_LOG: report, SMOKE_OUTPUT: '7392', ...overrides }
 }
 
-/** De string waarop de probe het antwoord herkent. */
-function probeNaald(): string {
-  const m = SRC.match(/elif ! echo "\$CODEX_PROBE_OUT" \| grep -q "([^"]+)"/)
-  if (!m) throw new Error('geen succes-grep gevonden in collab-preflight.sh')
-  return m[1]
-}
+it('uses the selected PATH installation and runs the offline checks without invoking exec by default', async () => {
+  const env = environment()
+  const binary = resolveExecutable('codex', env.PATH, root)
+  expect(binary).toBe(path.join(first, 'codex'))
+  expect(await checkCodexLaunch([binary, ...flags], env, root)).toContain('ChatGPT')
+  const calls = fs.readFileSync(report, 'utf8')
+  expect(calls).not.toContain(second)
+  expect(calls).not.toContain(' exec ')
+  expect(calls).toContain('assigned-model')
+})
 
-describe('codex-probe', () => {
-  it('zoekt niet naar een string die zelf in de prompt staat', () => {
-    const prompt = probePrompt()
-    const naald = probeNaald()
-    expect(
-      prompt.includes(naald),
-      `de probe grept op "${naald}" terwijl dat in de prompt "${prompt}" staat, dus de prompt-echo matcht altijd`,
-    ).toBe(false)
-  })
+it('rejects an unsupported interactive flag without sending a provider request', async () => {
+  const env = environment()
+  await expect(checkCodexLaunch([resolveExecutable('codex', env.PATH, root), '--unsupported'], env, root)).rejects.toThrow('interactive flags')
+  expect(fs.readFileSync(report, 'utf8')).not.toContain(' exec ')
+})
 
-  it('vraagt om een antwoord dat codex moet uitrekenen', () => {
-    expect(probePrompt()).toMatch(/\d+\s*(plus|\+)\s*\d+/i)
-  })
-
-  it('de gezochte uitkomst klopt met de som die gevraagd wordt', () => {
-    const m = probePrompt().match(/(\d+)\s*(?:plus|\+)\s*(\d+)/i)
-    expect(m, 'geen som in de prompt gevonden').not.toBeNull()
-    const som = Number(m![1]) + Number(m![2])
-    expect(probeNaald()).toBe(String(som))
-  })
+it.each([{ SMOKE_EXIT: '1', SMOKE_OUTPUT: 'provider rejected the model' }, { SMOKE_EXIT: '0', SMOKE_OUTPUT: 'Reply with only the decimal result of 7391 plus 1' }])('fails closed on an unavailable model or an echoed prompt', async overrides => {
+  vi.stubEnv('ENSEMBLE_CODEX_SMOKE_CHECK', '1')
+  const env = environment(overrides)
+  await expect(checkCodexLaunch([resolveExecutable('codex', env.PATH, root), ...flags], env, root)).rejects.toThrow('configured model')
+  const probe = fs.readFileSync(report, 'utf8').split('\n').find(line => line.includes(' exec '))!
+  expect(probe).toContain('--model assigned-model --config model_reasoning_effort="xhigh"')
+  expect(probe).not.toContain('--no-alt-screen')
+  expect(probe).toContain('--sandbox read-only')
 })

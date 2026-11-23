@@ -2,7 +2,11 @@
   "codex": {
     "name": "codex",
     "command": "codex",
-    "flags": ["--dangerously-bypass-approvals-and-sandbox"],
+    "flags": [
+    "--dangerously-bypass-approvals-and-sandbox",
+    "--model", "gpt-6.1-sol",
+    "--config", "model_reasoning_effort=\"high\""
+    ],
     "readyMarker": "›",
     "inputMethod": "pasteFromFile",
     "color": "blue",
@@ -20,7 +24,11 @@
   "agy": {
     "name": "agy",
     "command": "agy",
-    "flags": ["--dangerously-skip-permissions"],
+    "flags": [
+      "--dangerously-skip-permissions",
+      "--model", "gemini-3.8-flash-high",
+      "--effort", "high"
+    ],
     "readyMarker": "? for shortcuts",
     "inputMethod": "sendKeys",
     "color": "red",
@@ -48,9 +56,16 @@
   "grok": {
     "name": "grok",
     "command": "grok",
-    "flags": ["--always-approve", "--trust"],
+    "flags": [
+      "--always-approve",
+      "--trust",
+      "--model", "grok-4.7",
+      "--effort", "xhigh",
+      "--max-turns", "30"
+    ],
     "readyMarker": "❯",
     "inputMethod": "pasteFromFile",
+    "pasteEnterCount": 1,
     "color": "white",
     "icon": "✕"
   },

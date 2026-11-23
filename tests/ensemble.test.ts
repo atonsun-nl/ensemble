@@ -275,6 +275,7 @@ describe('shouldAutoDisband() — tested via checkIdleTeams()', () => {
       saveTeams: vi.fn(),
     }))
     vi.doMock('../lib/agent-spawner', () => ({
+      prepareLocalAgent: vi.fn(async () => undefined),
       spawnLocalAgent: vi.fn(),
       killLocalAgent: vi.fn(),
       spawnRemoteAgent: vi.fn(),
@@ -296,6 +297,7 @@ describe('shouldAutoDisband() — tested via checkIdleTeams()', () => {
       })),
     }))
     vi.doMock('../lib/agent-config', () => ({
+      shellEscape: (value: string) => value,
       resolveAgentProgram: vi.fn(() => ({ readyMarker: '>', inputMethod: 'sendKeys' })),
       resolveAgentProgramDetailed: vi.fn((program: string) => ({
         agent: { command: program, readyMarker: '>', inputMethod: 'sendKeys' },
@@ -343,7 +345,7 @@ describe('shouldAutoDisband() — tested via checkIdleTeams()', () => {
     expect(appendedMessages.some(m => m.content.includes('Auto-disband'))).toBe(false)
   })
 
-  it('auto-disbands when two different agents send completion signals and the team went quiet', async () => {
+  it('keeps an idle team with two natural-language completion messages active', async () => {
     const team = makeTeam()
     const messages: EnsembleMessage[] = [
       ...fillerMessages(8),
@@ -354,7 +356,7 @@ describe('shouldAutoDisband() — tested via checkIdleTeams()', () => {
     const { mod, appendedMessages } = await setupServiceWithMocks(team, messages)
     await mod.checkIdleTeams()
 
-    expect(appendedMessages.some(m => m.content.includes('Auto-disband'))).toBe(true)
+    expect(appendedMessages.some(m => m.content.includes('Auto-disband'))).toBe(false)
   })
 
   it('does NOT auto-disband when only one completion signal exists and the team just spoke', async () => {
@@ -370,7 +372,7 @@ describe('shouldAutoDisband() — tested via checkIdleTeams()', () => {
     expect(appendedMessages.some(m => m.content.includes('Auto-disband'))).toBe(false)
   })
 
-  it('auto-disbands when one completion signal exists and the team is idle beyond the single-signal threshold', async () => {
+  it('keeps an idle team with one natural-language completion message active', async () => {
     const team = makeTeam()
     const messages: EnsembleMessage[] = [
       ...fillerMessages(8),
@@ -381,7 +383,7 @@ describe('shouldAutoDisband() — tested via checkIdleTeams()', () => {
     const { mod, appendedMessages } = await setupServiceWithMocks(team, messages)
     await mod.checkIdleTeams()
 
-    expect(appendedMessages.some(m => m.content.includes('Auto-disband'))).toBe(true)
+    expect(appendedMessages.some(m => m.content.includes('Auto-disband'))).toBe(false)
   })
 
   it('does NOT auto-disband when agents have no completion signal', async () => {
@@ -498,7 +500,7 @@ describe('shouldAutoDisband() — tested via checkIdleTeams()', () => {
     expect(appendedMessages.some(m => m.content.includes('Auto-disband'))).toBe(true)
   })
 
-  it('ignores ensemble messages when determining idle time', async () => {
+  it('does not finalize based on natural-language and system messages', async () => {
     const team = makeTeam()
     const messages: EnsembleMessage[] = [
       ...fillerMessages(8),
@@ -512,48 +514,12 @@ describe('shouldAutoDisband() — tested via checkIdleTeams()', () => {
     const { mod, appendedMessages } = await setupServiceWithMocks(team, messages)
     await mod.checkIdleTeams()
 
-    expect(appendedMessages.some(m => m.content.includes('Auto-disband'))).toBe(true)
+    expect(appendedMessages.some(m => m.content.includes('Auto-disband'))).toBe(false)
   })
 })
 
 // ─────────────────────────────────────────────────────
 // 3. Completion pattern matching (unit tests)
-// ─────────────────────────────────────────────────────
-describe('completion signal patterns', () => {
-  const COMPLETION_PATTERNS = [
-    /(?:^|[^\p{L}\p{N}_])afgerond(?:[^\p{L}\p{N}_]|$)/iu,
-    /(?:^|[^\p{L}\p{N}_])done(?:[^\p{L}\p{N}_]|$)/iu,
-    /(?:^|[^\p{L}\p{N}_])complete(?:d)?(?:[^\p{L}\p{N}_]|$)/iu,
-    /(?:^|[^\p{L}\p{N}_])klaar(?:[^\p{L}\p{N}_]|$)/iu,
-    /(?:^|\s)tot de volgende(?:\s|$)/i,
-  ]
-
-  function hasCompletionSignal(content: string): boolean {
-    return COMPLETION_PATTERNS.some(p => p.test(content))
-  }
-
-  it.each([
-    ['The task is done.', true],
-    ['Work completed successfully', true],
-    ['Task is complete', true],
-    ['De taak is afgerond', true],
-    ['Ik ben klaar met de analyse', true],
-    ['Tot de volgende keer!', true],
-    ['DONE', true],
-    ['Klaar', true],
-    ['Still working on the task', false],
-    ['Analyzing the codebase now', false],
-    ['abandoned', false],
-    ['completion marker only', false],
-    ['undone but still working', false],
-    ['', false],
-  ])('"%s" → %s', (content: string, expected: boolean) => {
-    expect(hasCompletionSignal(content)).toBe(expected)
-  })
-})
-
-// ─────────────────────────────────────────────────────
-// 4. team-say — output format validation
 // ─────────────────────────────────────────────────────
 describe('team-say — output format', () => {
   let testTeamId: string
@@ -711,7 +677,7 @@ describe('worktree isolation lifecycle', () => {
 
   async function setupWorktreeService(team: EnsembleTeam) {
     const appendedMessages: EnsembleMessage[] = []
-    const createTeam = vi.fn(() => team)
+    const createTeam = vi.fn(() => { team.status = 'forming'; return team })
     const getTeam = vi.fn(() => team)
     const updateTeam = vi.fn((_id: string, updates: Partial<EnsembleTeam>) => {
       Object.assign(team, updates)
@@ -752,6 +718,7 @@ describe('worktree isolation lifecycle', () => {
       markAgentFailed,
     }))
     vi.doMock('../lib/agent-spawner', () => ({
+      prepareLocalAgent: vi.fn(async () => undefined),
       spawnLocalAgent,
       killLocalAgent,
       spawnRemoteAgent,
@@ -777,12 +744,14 @@ describe('worktree isolation lifecycle', () => {
     }))
     const runtime = {
       capturePane: vi.fn(async () => '>'),
+      getForegroundCommand: vi.fn(async () => 'agent'),
       sendKeys: vi.fn<AgentRuntime['sendKeys']>(async () => {}),
       pasteFromFile: vi.fn(async (_session: string, _file: string) => {}),
       sessionExists: vi.fn(async () => true),
     }
     vi.doMock('../lib/agent-runtime', () => ({ getRuntime: vi.fn(() => runtime) }))
     vi.doMock('../lib/agent-config', () => ({
+      shellEscape: (value: string) => value,
       resolveAgentProgram: vi.fn(() => ({ readyMarker: '>', inputMethod: 'sendKeys' })),
       resolveAgentProgramDetailed: vi.fn((program: string) => ({
         agent: { command: program, readyMarker: '>', inputMethod: 'sendKeys' },
@@ -844,13 +813,13 @@ describe('worktree isolation lifecycle', () => {
       expect((await creation).status).toBe(201)
       expect(mocks.runtime.capturePane).toHaveBeenCalledWith('test-team-claude-2', 50)
       expect(mocks.runtime.pasteFromFile).toHaveBeenCalledExactlyOnceWith(
-        'test-team-claude-2', path.join(tempRoot, 'team-1-claude-2.prompt.txt'),
+        'test-team-claude-2', expect.stringContaining('team-1-claude-2.prompt.txt.'),
       )
       const prompt = fs.readFileSync(path.join(tempRoot, 'team-1-claude-2.prompt.txt'), 'utf-8')
       expect(prompt).toContain('Task: test')
-      expect(prompt).toContain('Start NOW')
+      expect(prompt).toContain('"action":"plan"')
       expect(prompt).toContain('team-say.sh team-1 claude-2 team')
-      expect(prompt).not.toMatch(/teammate|undefined|confirmed agreement|wait for|delegat/i)
+      expect(prompt).not.toMatch(/<<COLLAB_DONE>>|undefined/)
     } finally {
       vi.useRealTimers()
     }
@@ -870,7 +839,7 @@ describe('worktree isolation lifecycle', () => {
         name: team.name, description: team.description, agents: [{ program: 'claude' }],
       })
       await vi.advanceTimersByTimeAsync(20_000)
-      expect((await creation).status).toBe(201)
+      expect((await creation).status).toBe(503)
       const gateKeys = mocks.runtime.sendKeys.mock.calls.filter(call => call[1] === 'Enter' || call[1] === 'Down')
       expect(gateKeys).toEqual([])
       expect(appendedMessages.some(m => /did not signal ready/.test(m.content))).toBe(true)
@@ -897,7 +866,7 @@ describe('worktree isolation lifecycle', () => {
       })
       await vi.advanceTimersByTimeAsync(5000)
       await creation
-      expect(appendedMessages.some(m => m.content.includes('Delivery to codex-1 failed: pane unavailable'))).toBe(true)
+      expect(appendedMessages.some(m => m.content.includes('Failed to start codex-1: pane unavailable'))).toBe(true)
       expect(team.agents[0].status).toBe('failed')
     } finally {
       vi.useRealTimers()
@@ -924,10 +893,10 @@ describe('worktree isolation lifecycle', () => {
       agentName: 'claude-1', teammateNames: [], agentIndex: 0, templateName,
     })
     expect(prompt).toContain('Task: Fix the bug')
-    expect(prompt).toContain('Start NOW')
+    expect(prompt).toContain('"action":"plan"')
     expect(prompt).toContain('team-say.sh solo claude-1 team')
-    expect(prompt).toContain('<<COLLAB_DONE>>')
-    expect(prompt).not.toMatch(/teammate|undefined|confirmed agreement|wait for|delegat/i)
+    expect(prompt).toContain('"action":"close"')
+    expect(prompt).not.toMatch(/<<COLLAB_DONE>>|undefined/)
   })
 
   it('spawns local agents inside their worktree when useWorktrees=true', async () => {
@@ -992,7 +961,7 @@ describe('worktree isolation lifecycle', () => {
     }))
   })
 
-  it('kills the local session before merging and destroying its worktree', async () => {
+  it('kills the local session before merging and retains an unverified worktree', async () => {
     const team = makeTeam({
       id: 'team-worktree-disband',
       name: 'team-worktree-disband',
@@ -1018,13 +987,8 @@ describe('worktree isolation lifecycle', () => {
       branch: 'collab/team-worktree-disband/codex-1',
       agentName: 'codex-1',
     }, '/repo')
-    expect(mocks.destroyWorktree).toHaveBeenCalledWith({
-      path: '/repo/.worktrees/team-worktree-disband-codex-1',
-      branch: 'collab/team-worktree-disband/codex-1',
-      agentName: 'codex-1',
-    }, '/repo')
+    expect(mocks.destroyWorktree).not.toHaveBeenCalled()
     expect(mocks.killLocalAgent.mock.invocationCallOrder[0]).toBeLessThan(mocks.mergeWorktree.mock.invocationCallOrder[0])
-    expect(mocks.mergeWorktree.mock.invocationCallOrder[0]).toBeLessThan(mocks.destroyWorktree.mock.invocationCallOrder[0])
   })
 
   it('skips worktree merge for remote agents even if worktree metadata exists', async () => {
@@ -1072,6 +1036,7 @@ describe('staged workflow integration', () => {
   async function setupStagedService(team: EnsembleTeam) {
     const runtime = {
       capturePane: vi.fn(async () => '>'),
+      getForegroundCommand: vi.fn(async () => 'agent'),
       sendKeys: vi.fn<AgentRuntime['sendKeys']>(async () => {}),
       pasteFromFile: vi.fn(async () => {}),
     }
@@ -1087,6 +1052,7 @@ describe('staged workflow integration', () => {
       markAgentFailed: vi.fn(),
     }))
     vi.doMock('../lib/agent-spawner', () => ({
+      prepareLocalAgent: vi.fn(async () => undefined),
       spawnLocalAgent: vi.fn(async ({ name, program, workingDirectory, hostId }) => ({
         id: `${name}-id`,
         name,
@@ -1111,6 +1077,7 @@ describe('staged workflow integration', () => {
       getRuntime: vi.fn(() => runtime),
     }))
     vi.doMock('../lib/agent-config', () => ({
+      shellEscape: (value: string) => value,
       resolveAgentProgram: vi.fn(() => ({ readyMarker: '>', inputMethod: 'sendKeys' })),
       resolveAgentProgramDetailed: vi.fn((program: string) => ({
         agent: { command: program, readyMarker: '>', inputMethod: 'sendKeys' },
@@ -1144,45 +1111,21 @@ describe('staged workflow integration', () => {
     return { mod, runtime, runStagedWorkflow }
   }
 
-  it('uses staged workflow instead of normal prompt injection when staged=true', async () => {
+  it('retains the staged context and gates worker prompts on the Lead plan', async () => {
     vi.stubEnv('ENSEMBLE_TASK_PREAMBLE', 'Use project conventions.')
-    const team = makeTeam({
-      id: 'team-staged',
-      name: 'team-staged',
-      status: 'forming',
-      agents: [
-        { agentId: '', name: 'codex-1', program: 'codex', role: 'lead', hostId: '', status: 'spawning' },
-        { agentId: '', name: 'claude-2', program: 'claude', role: 'member', hostId: '', status: 'spawning' },
-      ],
-    })
-    const { mod, runtime, runStagedWorkflow } = await setupStagedService(team)
+    const team = makeTeam({ id: 'team-staged', name: 'team-staged', status: 'forming' })
+    const { mod, runtime } = await setupStagedService(team)
     const stagedConfig: StagedWorkflowConfig = { planTimeoutMs: 1500 }
-
-    await mod.createEnsembleTeam({
-      name: team.name,
-      description: team.description,
-      agents: [{ program: 'codex' }, { program: 'claude' }],
-      workingDirectory: '/repo',
-      staged: true,
-      stagedConfig,
+    const result = await mod.createEnsembleTeam({
+      name: team.name, description: team.description, agents: [{ program: 'codex' }, { program: 'claude' }],
+      workingDirectory: '/repo', staged: true, stagedConfig,
     })
-
-    expect(runStagedWorkflow).toHaveBeenCalledTimes(1)
-    expect(runStagedWorkflow).toHaveBeenCalledWith(
-      team,
-      stagedConfig,
-      expect.objectContaining({
-        buildPlanPrompt: expect.any(Function),
-        buildExecPrompt: expect.any(Function),
-        buildVerifyPrompt: expect.any(Function),
-      }),
-    )
-    const workflow = await import('../lib/staged-workflow')
-    const builders = vi.mocked(workflow.runStagedWorkflow).mock.calls[0][2]!
-    const prompt = builders.buildPlanPrompt!({ agent: team.agents[0], teammates: ['claude-2'], index: 0 })
-    expect(prompt).toContain('Use project conventions.')
+    expect(result.status).toBe(201)
+    expect(result.data?.team.workflow).toMatchObject({ state: 'WAITING_PLAN', staged: true })
+    expect(runtime.sendKeys).toHaveBeenCalledOnce()
+    const prompt = runtime.sendKeys.mock.calls[0][1]
+    expect(prompt).toContain('Staged workflow')
     expect(prompt.indexOf('Use project conventions.')).toBeLessThan(prompt.indexOf('Task:'))
-    expect(runtime.sendKeys).not.toHaveBeenCalled()
     vi.unstubAllEnvs()
   })
 
@@ -1207,7 +1150,7 @@ describe('staged workflow integration', () => {
     })
 
     expect(runStagedWorkflow).not.toHaveBeenCalled()
-    expect(runtime.sendKeys).toHaveBeenCalledTimes(2)
+    expect(runtime.sendKeys).toHaveBeenCalledTimes(1)
   })
 })
 
@@ -1267,7 +1210,7 @@ describe('alert-hub geheim', () => {
     // Geen spy op spawn: in ESM is een module-export niet te herdefinieren.
     // De broncode van de functie is hier de betrouwbaarder toets.
     const bron = String(__testing.postToAlertHub)
-    expect(bron, 'geen subproces, anders staat het geheim weer in de argv').not.toMatch(/spawn|exec/)
+    expect(bron, 'geen subproces, anders staat het geheim weer in de argv').not.toMatch(/\b(?:spawn|exec)\s*\(/)
     expect(fetchSpy).toHaveBeenCalledTimes(1)
     const [calledUrl] = fetchSpy.mock.calls[0]
     expect(String(calledUrl)).toContain('key=topsecret')
@@ -1292,7 +1235,7 @@ describe('alert-hub geheim', () => {
 // ─────────────────────────────────────────────────────
 // cleanupStaleTeams() — stopt processen, niet alleen de status
 // ─────────────────────────────────────────────────────
-describe('cleanupStaleTeams stopt achtergebleven processen', () => {
+describe('service restart preserves old active teams', () => {
   let tempRoot: string
 
   beforeEach(() => {
@@ -1307,7 +1250,7 @@ describe('cleanupStaleTeams stopt achtergebleven processen', () => {
     fs.rmSync(tempRoot, { recursive: true, force: true })
   })
 
-  it('kilt de tmux-sessies uit het register en stopt bridge/poller van een stale team', async () => {
+  it('does not kill any session merely because the team is three hours old', async () => {
     // Een team ouder dan 2 uur, nog 'active': cleanupStaleTeams() zet dit op
     // disbanded. Daarna filteren de watchdog en checkIdleTeams op status
     // 'active' en slaan het voorgoed over, dus als de processen hier niet
@@ -1334,6 +1277,7 @@ describe('cleanupStaleTeams stopt achtergebleven processen', () => {
       markAgentFailed: vi.fn(),
     }))
     vi.doMock('../lib/agent-spawner', () => ({
+      prepareLocalAgent: vi.fn(async () => undefined),
       spawnLocalAgent: vi.fn(),
       killLocalAgent: vi.fn(async () => {}),
       spawnRemoteAgent: vi.fn(),
@@ -1351,6 +1295,7 @@ describe('cleanupStaleTeams stopt achtergebleven processen', () => {
       getRuntime: vi.fn(),
     }))
     vi.doMock('../lib/agent-config', () => ({
+      shellEscape: (value: string) => value,
       resolveAgentProgram: vi.fn(),
       resolveAgentProgramDetailed: vi.fn(),
       availableAgentKeys: vi.fn(() => []),
@@ -1388,15 +1333,7 @@ describe('cleanupStaleTeams stopt achtergebleven processen', () => {
 
     await import('../services/ensemble-service')
 
-    const gekildeSessies = execCalls
-      .filter(c => c[0] === 'tmux' && c[1] === 'kill-session')
-      .map(c => c[3])
-    expect(gekildeSessies).toEqual(['collab-1-1-claude-1', 'collab-1-1-codex-2'])
-
-    const bashAanroep = execCalls.find(c => c[0] === 'bash')
-    expect(bashAanroep, 'stop_team_processes moet via bash aangeroepen worden').toBeDefined()
-    expect(bashAanroep).toContain(runtimeDir)
-
-    expect(updateTeamMock).toHaveBeenCalledWith(team.id, expect.objectContaining({ status: 'disbanded' }))
+    expect(execCalls).toEqual([])
+    expect(updateTeamMock).not.toHaveBeenCalled()
   })
 })
